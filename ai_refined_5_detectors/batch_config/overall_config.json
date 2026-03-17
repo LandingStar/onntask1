@@ -1,0 +1,8 @@
+{
+    "max_parallel": 1,
+
+    "epochs": 5,
+    "learning_rate": 0.001,
+    "label_num": 20,
+    "run_evaluate_after_train": true
+}
