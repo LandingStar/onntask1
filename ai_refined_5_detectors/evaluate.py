@@ -20,7 +20,31 @@ import seaborn as sns
 from sklearn.metrics import confusion_matrix
 
 # 4. Local imports
-from train import DNN, cpu_transform, detector_pos_xy, detector_region
+from train import DNN, cpu_transform
+import json
+import os
+
+config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+with open(config_path) as f:
+    config = json.load(f)
+
+# Detectors
+detector_pos_init_config = config.get('detector_pos', None)
+detector_pos_xy = []
+
+if detector_pos_init_config is not None:
+    for x, y in detector_pos_init_config:
+        detector_pos_xy.append((x, y))
+else:
+    detector_pos_init = [
+        (803, 843, 273, 313),
+        (941, 981, 463, 503),
+        (941, 981, 697, 737),
+        (580, 620, 960, 1000),
+        (219, 259, 697, 737),
+    ]
+    for x0, x1, y0, y1 in detector_pos_init:
+        detector_pos_xy.append(((x0+x1)/2, (y0+y1)/2))
 
 import json
 

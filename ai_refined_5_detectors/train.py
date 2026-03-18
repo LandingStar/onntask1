@@ -92,7 +92,7 @@ gpu_transform = v2.Compose([
         scale=(0.97, 1.03), 
         shear=None
     ),
-    v2.ElasticTransform(alpha=100.0, sigma=5.0),
+    #v2.ElasticTransform(alpha=100.0, sigma=5.0),
     v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]),
     v2.ColorJitter(brightness=0.4, contrast=0.4),
     v2.RandomPerspective(distortion_scale=0.2, p=0.3),
@@ -139,18 +139,25 @@ class Propagation_Layer(torch.nn.Module):
         angular_spectrum = torch.fft.ifft2(fft_c * self.phase)
         return angular_spectrum
 
-# Detectors - REDUCED TO 5
-detector_pos_init = [
-    (803, 843, 273, 313),
-    (941, 981, 463, 503),
-    (941, 981, 697, 737),
-    (580, 620, 960, 1000),
-    (219, 259, 697, 737),
-    # Removed the 6th one: (357, 397, 273, 313)
-]
+# Initialize detector positions
+detector_pos_init_config = config.get('detector_pos', None)
 detector_pos_xy = []
-for x0, x1, y0, y1 in detector_pos_init:
-    detector_pos_xy.append(((x0+x1)/2, (y0+y1)/2))
+
+if detector_pos_init_config is not None:
+    # Use config positions directly (assuming they are [x, y] center coordinates)
+    for x, y in detector_pos_init_config:
+        detector_pos_xy.append((x, y))
+else:
+    # Fallback to hardcoded detectors
+    detector_pos_init = [
+        (803, 843, 273, 313),
+        (941, 981, 463, 503),
+        (941, 981, 697, 737),
+        (580, 620, 960, 1000),
+        (219, 259, 697, 737),
+    ]
+    for x0, x1, y0, y1 in detector_pos_init:
+        detector_pos_xy.append(((x0+x1)/2, (y0+y1)/2))
 
 def detector_region(Int, detector_mask=None, detector_minus=None, detector_pos=None, detector_size=60):
     num_det = len(detector_pos)
