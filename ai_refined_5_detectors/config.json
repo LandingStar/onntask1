@@ -53,6 +53,7 @@
     "soft_label_temperature": 0.5,
     "phase_noise_relative": 0.05,
     "exp_name": "floating_5det_wide",
+    "save_csv_logs": false,
     "inherit_best_model": false,
     "results_dir": "results",
     "run_evaluate_after_train": true,

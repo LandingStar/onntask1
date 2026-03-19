@@ -17,6 +17,7 @@ from torchvision.transforms import v2
 from tqdm import tqdm
 
 import json
+import sys
 
 # Load Config
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -411,6 +412,15 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         
     print(f"Training started. Classes: {classes_num}, Labels: {label_num}")
     
+    # Setup training log file
+    log_file_path = os.path.join(save_dir, "training_log.txt")
+    with open(log_file_path, "w") as f:
+        f.write(f"Experiment: {exp_name}\n")
+        f.write(f"Date: {currentDate}\n")
+        f.write("="*50 + "\n")
+        f.write("Epoch | Train Loss | Train Acc | Val Loss | Val Acc | LR | Time(s) | Status\n")
+        f.write("-" * 80 + "\n")
+    
     start_time = time.time()
 
     def compute_loss(images, labels, out_img, output_vec):
@@ -528,6 +538,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         return is_correct
 
     for epoch in range(epochs):
+        epoch_start_time = time.time()
         ep_train_loss = 0
         model.train()
         correct = 0
@@ -637,22 +648,38 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         print(f"Train Loss: {avg_train_loss:.6f} | Train Acc: {train_acc:.6f}")
         print(f"Val Loss: {avg_test_loss:.6f} | Val Acc: {test_acc:.6f}")
         
+        status_msg = ""
         if test_acc > best_acc:
             best_acc = test_acc
             torch.save(model.state_dict(), f"{save_dir}/best_model.pth")
             print(f"Saved best model with acc: {best_acc:.6f}")
+            status_msg = "Best Model Saved"
+            
+        epoch_time = time.time() - epoch_start_time
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Write to log file
+        with open(log_file_path, "a") as f:
+            f.write(f"{epoch+1:5d} | {avg_train_loss:10.6f} | {train_acc:9.4f} | {avg_test_loss:8.6f} | {test_acc:7.4f} | {current_lr:.2e} | {epoch_time:7.2f} | {status_msg}\n")
         
         # Plotting
         plot_loss_acc(train_loss_hist, test_loss_hist, train_acc_hist, test_acc_hist, f"{save_dir}/loss_acc.png")
         
-        # Save Outputs
-        csv_log_dir = f"{save_dir}/csv_logs"
-        os.makedirs(csv_log_dir, exist_ok=True)
-        np.savetxt(f"{csv_log_dir}/mask_epoch_{epoch+1}.csv", model.phase_mask[0].detach().cpu().numpy(), delimiter=",")
-        np.savetxt(f"{csv_log_dir}/detector_pos_epoch_{epoch+1}.csv", model.detector_pos.detach().cpu().numpy(), delimiter=",")
+        # Save Outputs (if configured)
+        if config.get("save_csv_logs", False):
+            csv_log_dir = f"{save_dir}/csv_logs"
+            os.makedirs(csv_log_dir, exist_ok=True)
+            np.savetxt(f"{csv_log_dir}/mask_epoch_{epoch+1}.csv", model.phase_mask[0].detach().cpu().numpy(), delimiter=",")
+            np.savetxt(f"{csv_log_dir}/detector_pos_epoch_{epoch+1}.csv", model.detector_pos.detach().cpu().numpy(), delimiter=",")
 
     elapsed_time = time.time() - start_time
     print(f"Total time for {epochs} epochs: {elapsed_time:.2f} seconds")
+    
+    with open(log_file_path, "a") as f:
+        f.write("-" * 80 + "\n")
+        f.write(f"Total training time: {elapsed_time:.2f} seconds\n")
+        f.write(f"Best Validation Accuracy: {best_acc:.6f}\n")
+        
     return elapsed_time
 
 if __name__ == "__main__":
@@ -698,22 +725,20 @@ if __name__ == "__main__":
         # Run Evaluation if configured
         if config.get("run_evaluate_after_train", True):
             print("\n--- Running Evaluation ---")
-            from evaluate import evaluate
-            evaluate()
+            # Run as a subprocess to avoid context/memory issues and ensure it works cross-platform
+            import subprocess
+            try:
+                subprocess.run([sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Evaluation script failed: {e}")
             
         # Archive Results
         print("\n--- Archiving Results ---")
         try:
-            from archive_results import archive_and_cleanup
-            
-            # Re-resolve results_dir based on config
-            results_dir_final = config.get('results_dir', 'results')
-            if not os.path.isabs(results_dir_final):
-                results_dir_final = os.path.join(BASE_DIR, results_dir_final)
-                
-            archive_and_cleanup(results_dir_final, keep_recent=3, keep_total=15)
+            import subprocess
+            subprocess.run([sys.executable, os.path.join(BASE_DIR, 'archive_results.py')], check=True)
         except Exception as e:
-            print(f"Archiving failed: {e}")
+            print(f"Archiving script failed: {e}")
         
     except Exception as e:
         print(f"Error: {e}")

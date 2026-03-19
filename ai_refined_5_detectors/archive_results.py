@@ -56,6 +56,9 @@ def archive_and_cleanup(results_dir, keep_recent=3, keep_total=15):
     # Sort by time descending (newest first)
     items.sort(key=lambda x: x['time'], reverse=True)
 
+    # Cross-platform compatibility flag for zip handling
+    is_windows = os.name == 'nt'
+
     # Process items
     for i, item in enumerate(items):
         # 1. Delete if beyond keep_total
@@ -63,7 +66,16 @@ def archive_and_cleanup(results_dir, keep_recent=3, keep_total=15):
             print(f"[Delete] Deleting old result: {item['name']}")
             try:
                 if os.path.isdir(item['path']):
-                    shutil.rmtree(item['path'])
+                    # In Linux, shutil.rmtree sometimes faces permission issues or symlink issues, 
+                    # but ignore_errors=True helps bypass non-critical blocks.
+                    shutil.rmtree(item['path'], ignore_errors=True)
+                    # If still exists (e.g. read-only files on some OS), fallback to forcing
+                    if os.path.exists(item['path']):
+                        import stat
+                        def remove_readonly(func, path, excinfo):
+                            os.chmod(path, stat.S_IWRITE)
+                            func(path)
+                        shutil.rmtree(item['path'], onerror=remove_readonly)
                 else:
                     os.remove(item['path'])
             except Exception as e:
@@ -83,21 +95,23 @@ def archive_and_cleanup(results_dir, keep_recent=3, keep_total=15):
             print(f"[Archive] Compressing result: {item['name']} -> {os.path.basename(zip_path)}")
             
             try:
-                # Create Zip
-                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    # Walk through the directory
-                    for root, dirs, files in os.walk(item['path']):
-                        for file in files:
-                            file_path = os.path.join(root, file)
-                            # Archive name should be relative to the results_dir so it unzips into a folder
-                            # We want the zip to contain the folder "exp_name_date/..."
-                            # So we calculate relpath from results_dir
-                            arcname = os.path.relpath(file_path, results_dir)
-                            zipf.write(file_path, arcname)
+                # Create Zip (use shutil.make_archive for better cross-platform reliability)
+                shutil.make_archive(
+                    base_name=os.path.join(results_dir, item['base_name']),
+                    format='zip',
+                    root_dir=results_dir,
+                    base_dir=item['name']
+                )
                 
                 # Verify zip creation before deleting original folder
                 if os.path.exists(zip_path):
-                    shutil.rmtree(item['path'])
+                    shutil.rmtree(item['path'], ignore_errors=True)
+                    if os.path.exists(item['path']):
+                        import stat
+                        def remove_readonly(func, path, excinfo):
+                            os.chmod(path, stat.S_IWRITE)
+                            func(path)
+                        shutil.rmtree(item['path'], onerror=remove_readonly)
             except Exception as e:
                 print(f"  Failed to archive {item['name']}: {e}")
                 # If zip was created partially, try to remove it
@@ -110,6 +124,19 @@ def archive_and_cleanup(results_dir, keep_recent=3, keep_total=15):
 if __name__ == "__main__":
     # Test block
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    # Default results dir relative to this script
-    test_results_dir = os.path.join(BASE_DIR, 'results')
+    
+    # Load config to get dynamic results_dir
+    config_path = os.path.join(BASE_DIR, 'config.json')
+    results_dir = 'results'
+    if os.path.exists(config_path):
+        import json
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            results_dir = config.get('results_dir', 'results')
+            
+    if not os.path.isabs(results_dir):
+        test_results_dir = os.path.join(BASE_DIR, results_dir)
+    else:
+        test_results_dir = results_dir
+        
     archive_and_cleanup(test_results_dir)
