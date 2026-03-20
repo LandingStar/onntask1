@@ -58,18 +58,78 @@ if os.path.exists(config_path):
 else:
     print(f"Config not found at {config_path}, using defaults")
 
-# Constants
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-BATCH_SIZE = config.get('batch_size', 16)
-IMG_SIZE = config.get('img_size', [1000, 1000])
-PhaseMask = config.get('phase_mask_size', [1200, 1200])
-PADDINGx = (PhaseMask[0] - IMG_SIZE[0]) // 2
-PADDINGy = (PhaseMask[1] - IMG_SIZE[1]) // 2
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
 def evaluate():
+    # 1. Find the latest result directory first
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    
+    # Temporarily load main config just to find results_dir base path
+    main_config_path = os.path.join(BASE_DIR, 'config.json')
+    main_config = {}
+    if os.path.exists(main_config_path):
+        with open(main_config_path, 'r') as f:
+            main_config = json.load(f)
+            
+    results_dir_config = main_config.get('results_dir', 'results')
+    if not os.path.isabs(results_dir_config):
+        results_dir = os.path.join(BASE_DIR, results_dir_config)
+    else:
+        results_dir = results_dir_config
+        
+    latest_subdir = None
+    if os.path.exists(results_dir):
+        subdirs = [os.path.join(results_dir, d) for d in os.listdir(results_dir) if os.path.isdir(os.path.join(results_dir, d))]
+        if subdirs:
+            latest_subdir = max(subdirs, key=os.path.getmtime)
+            
+    if not latest_subdir:
+        print(f"No result subdirectories found in {results_dir}.")
+        return
+
+    print(f"Latest result directory found: {latest_subdir}")
+
+    # 2. Load the config specific to THIS result directory
+    result_config_path = os.path.join(latest_subdir, 'config.json')
+    if os.path.exists(result_config_path):
+        with open(result_config_path, 'r') as f:
+            config = json.load(f)
+        print(f"Loaded config from {result_config_path}")
+    else:
+        print(f"Warning: config.json not found in {latest_subdir}. Using main config.")
+        config = main_config
+        
     exp_name = config.get('exp_name', 'floating_5det')
     print(f"Starting evaluation for Task 1: {exp_name}...")
+    
+    # Set constants from the loaded config
+    BATCH_SIZE = config.get('batch_size', 16)
+    IMG_SIZE = config.get('img_size', [1000, 1000])
+    PhaseMask = config.get('phase_mask_size', [1200, 1200])
+    PADDINGx = (PhaseMask[0] - IMG_SIZE[0]) // 2
+    PADDINGy = (PhaseMask[1] - IMG_SIZE[1]) // 2
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 3. Detectors config overriding
+    # Override global detector_pos with the one from result config if it exists
+    detector_pos_init_config = config.get('detector_pos', None)
+    detector_pos_xy = []
+    if detector_pos_init_config is not None:
+        for x, y in detector_pos_init_config:
+            detector_pos_xy.append((x, y))
+    else:
+        detector_pos_init = [
+            (803, 843, 273, 313),
+            (941, 981, 463, 503),
+            (941, 981, 697, 737),
+            (580, 620, 960, 1000),
+            (219, 259, 697, 737),
+        ]
+        for x0, x1, y0, y1 in detector_pos_init:
+            detector_pos_xy.append(((x0+x1)/2, (y0+y1)/2))
+    
+    # We must patch the DNN class's global detector_pos_xy since it's initialized during class definition in train.py
+    import train
+    train.detector_pos_xy = detector_pos_xy
+    train.config = config # also inject config into train.py's scope so DNN init uses the right parameters
     
     # Dataset
     dataset_path_config = config.get('dataset_path', './dataset')
@@ -114,30 +174,12 @@ def evaluate():
     model = DNN(num_layers=num_layers, num_classes=num_classes, train_detector_pos=train_detector_pos).to(device)
     
     # Load Best Model
-    results_dir_config = config.get('results_dir', 'results')
-    if not os.path.isabs(results_dir_config):
-        results_dir = os.path.join(BASE_DIR, results_dir_config)
+    model_path = os.path.join(latest_subdir, "best_model.pth")
+    if os.path.exists(model_path):
+        print(f"Loading model from: {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     else:
-        results_dir = results_dir_config
-        
-    if os.path.exists(results_dir):
-        # Look for experiments matching exp_name
-        subdirs = [os.path.join(results_dir, d) for d in os.listdir(results_dir) if os.path.isdir(os.path.join(results_dir, d)) and exp_name in d]
-        # Fallback if specific name not found but others exist?
-        if not subdirs:
-             # Try default pattern if exp_name was not found
-             subdirs = [os.path.join(results_dir, d) for d in os.listdir(results_dir) if os.path.isdir(os.path.join(results_dir, d))]
-             
-        if subdirs:
-            latest_subdir = max(subdirs, key=os.path.getmtime)
-            model_path = os.path.join(latest_subdir, "best_model.pth")
-            print(f"Loading model from: {model_path}")
-            model.load_state_dict(torch.load(model_path, map_location=device))
-        else:
-            print(f"No result subdirectories found matching '{exp_name}'.")
-            return
-    else:
-        print(f"Results directory not found: {results_dir}")
+        print(f"Model file not found: {model_path}")
         return
 
     model.eval()

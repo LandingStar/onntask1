@@ -26,10 +26,45 @@ from train import DNN
 # Find model
 result_dir = sys.argv[1] if len(sys.argv) > 1 else None
 if result_dir is None:
+    # 1. Load main config to find results base dir
     results_base = os.path.join(os.path.dirname(__file__), config.get('results_dir', 'results'))
-    subdirs = [os.path.join(results_base, d) for d in os.listdir(results_base) 
-               if os.path.isdir(os.path.join(results_base, d))]
-    result_dir = max(subdirs, key=os.path.getmtime)
+    
+    # 2. Find latest subdir
+    if os.path.exists(results_base):
+        subdirs = [os.path.join(results_base, d) for d in os.listdir(results_base) 
+                   if os.path.isdir(os.path.join(results_base, d))]
+        if subdirs:
+            result_dir = max(subdirs, key=os.path.getmtime)
+        else:
+            print("No subdirectories found in results.")
+            sys.exit(1)
+    else:
+        print("Results directory not found.")
+        sys.exit(1)
+
+# 3. Load the config from the latest result directory to override main config
+result_config_path = os.path.join(result_dir, 'config.json')
+if os.path.exists(result_config_path):
+    with open(result_config_path, 'r') as f:
+        config = json.load(f)
+        
+    # Update dependent variables
+    IMG_SIZE = config.get('img_size', [1000, 1000])
+    PhaseMask = config.get('phase_mask_size', [1200, 1200])
+    PADDINGx = (PhaseMask[0] - IMG_SIZE[0]) // 2
+    PADDINGy = (PhaseMask[1] - IMG_SIZE[1]) // 2
+    
+    # We must also inject this config into train module so DNN initializes correctly
+    import train
+    train.config = config
+    
+    # Also patch detector_pos_xy if needed
+    detector_pos_init_config = config.get('detector_pos', None)
+    if detector_pos_init_config is not None:
+        detector_pos_xy = []
+        for x, y in detector_pos_init_config:
+            detector_pos_xy.append((x, y))
+        train.detector_pos_xy = detector_pos_xy
 
 model_path = os.path.join(result_dir, 'best_model.pth')
 print(f"Model: {model_path}")
