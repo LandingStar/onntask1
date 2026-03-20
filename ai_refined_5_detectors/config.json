@@ -35,9 +35,9 @@
     "detector_loss_weight": [
         0.8,
         1.07,
-        1.15,
+        1.2,
         1.05,
-        1.0
+        0.8
     ],
     "use_blur_background_loss": true,
     "blur_kernel_size": 21,
