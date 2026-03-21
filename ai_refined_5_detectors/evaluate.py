@@ -77,12 +77,42 @@ def evaluate():
         
     latest_subdir = None
     if os.path.exists(results_dir):
-        subdirs = [os.path.join(results_dir, d) for d in os.listdir(results_dir) if os.path.isdir(os.path.join(results_dir, d))]
-        if subdirs:
-            latest_subdir = max(subdirs, key=os.path.getmtime)
+        import re
+        from datetime import datetime
+        
+        # Regex to match default naming format: name_YYYYMMDD_HHMM
+        name_pattern = re.compile(r'^.+_(\d{8}_\d{4})$')
+        
+        valid_subdirs = []
+        for d in os.listdir(results_dir):
+            dir_path = os.path.join(results_dir, d)
+            if not os.path.isdir(dir_path):
+                continue
+                
+            # Determine effective path
+            target_path = None
+            target_name = d
+            
+            if os.path.exists(os.path.join(dir_path, "best_model.pth")):
+                target_path = dir_path
+            elif os.path.isdir(os.path.join(dir_path, d)) and os.path.exists(os.path.join(dir_path, d, "best_model.pth")):
+                target_path = os.path.join(dir_path, d)
+                
+            if target_path:
+                match = name_pattern.match(target_name)
+                if match:
+                    try:
+                        timestamp = datetime.strptime(match.group(1), "%Y%m%d_%H%M")
+                        valid_subdirs.append({'path': target_path, 'time': timestamp})
+                    except ValueError:
+                        pass
+                
+        if valid_subdirs:
+            latest_item = max(valid_subdirs, key=lambda x: x['time'])
+            latest_subdir = latest_item['path']
             
     if not latest_subdir:
-        print(f"No result subdirectories found in {results_dir}.")
+        print(f"No valid result subdirectories (containing best_model.pth and matching date format) found in {results_dir}.")
         return
 
     print(f"Latest result directory found: {latest_subdir}")
@@ -102,6 +132,22 @@ def evaluate():
     
     # Set constants from the loaded config
     BATCH_SIZE = config.get('batch_size', 16)
+    
+    # Auto-adjust BATCH_SIZE for evaluation based on VRAM to prevent OOM
+    if torch.cuda.is_available():
+        # Get total VRAM in GB
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        # Empirical scaling: 128 batch size takes ~4GB, 256 takes ~8GB for this model
+        if total_vram_gb < 6.0:
+            BATCH_SIZE = min(BATCH_SIZE, 32)
+        elif total_vram_gb < 10.0:
+            BATCH_SIZE = min(BATCH_SIZE, 64)
+        elif total_vram_gb < 16.0:
+            BATCH_SIZE = min(BATCH_SIZE, 128)
+        else:
+            BATCH_SIZE = min(BATCH_SIZE, 256)
+        print(f"Auto-adjusted BATCH_SIZE to {BATCH_SIZE} based on {total_vram_gb:.1f}GB VRAM.")
+    
     IMG_SIZE = config.get('img_size', [1000, 1000])
     PhaseMask = config.get('phase_mask_size', [1200, 1200])
     PADDINGx = (PhaseMask[0] - IMG_SIZE[0]) // 2

@@ -66,7 +66,12 @@ def run_one(cfg_file, shared_params, idx, total):
 
     try:
         merged = merge_config(shared_params, cfg_path)
-        exp_name = merged.get('exp_name', cfg_file)
+        # If exp_name is set in the individual config, use it. Otherwise, use the filename without .json
+        exp_name = merged.get('exp_name', os.path.splitext(cfg_file)[0])
+        # Force the exp_name in the merged config so train.py picks it up correctly
+        merged['exp_name'] = exp_name
+        # Important: set batch_train to False in the merged config so we don't infinitely loop
+        merged['batch_train'] = False
     except json.JSONDecodeError as e:
         print(f"  [{idx}/{total}] ERROR: Invalid JSON in {cfg_file}: {e}")
         return (cfg_file, 'SKIPPED', 'Invalid JSON')

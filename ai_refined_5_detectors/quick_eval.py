@@ -29,14 +29,43 @@ if result_dir is None:
     # 1. Load main config to find results base dir
     results_base = os.path.join(os.path.dirname(__file__), config.get('results_dir', 'results'))
     
-    # 2. Find latest subdir
+    # 2. Find latest valid subdir by parsing folder name date
     if os.path.exists(results_base):
-        subdirs = [os.path.join(results_base, d) for d in os.listdir(results_base) 
-                   if os.path.isdir(os.path.join(results_base, d))]
-        if subdirs:
-            result_dir = max(subdirs, key=os.path.getmtime)
+        import re
+        from datetime import datetime
+        
+        name_pattern = re.compile(r'^.+_(\d{8}_\d{4})$')
+        valid_subdirs = []
+        
+        for d in os.listdir(results_base):
+            dir_path = os.path.join(results_base, d)
+            if not os.path.isdir(dir_path):
+                continue
+                
+            target_path = None
+            target_name = d
+            
+            # Direct match
+            if os.path.exists(os.path.join(dir_path, "best_model.pth")):
+                target_path = dir_path
+            # Nested match (e.g. unzipped folders that created a double directory)
+            elif os.path.isdir(os.path.join(dir_path, d)) and os.path.exists(os.path.join(dir_path, d, "best_model.pth")):
+                target_path = os.path.join(dir_path, d)
+                
+            if target_path:
+                match = name_pattern.match(target_name)
+                if match:
+                    try:
+                        timestamp = datetime.strptime(match.group(1), "%Y%m%d_%H%M")
+                        valid_subdirs.append({'path': target_path, 'time': timestamp})
+                    except ValueError:
+                        pass
+                        
+        if valid_subdirs:
+            latest_item = max(valid_subdirs, key=lambda x: x['time'])
+            result_dir = latest_item['path']
         else:
-            print("No subdirectories found in results.")
+            print("No valid subdirectories (containing best_model.pth and matching date format) found in results.")
             sys.exit(1)
     else:
         print("Results directory not found.")
@@ -80,7 +109,21 @@ for _ in range(3):
     base = os.path.dirname(base)
 
 val_ds = torchvision.datasets.ImageFolder(f"{dataset_path}/val", transform=cpu_transform)
-val_dl = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=0)
+
+# Auto-adjust BATCH_SIZE based on VRAM
+eval_batch_size = config.get('batch_size', 16)
+if torch.cuda.is_available():
+    total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    if total_vram_gb < 6.0:
+        eval_batch_size = min(eval_batch_size, 32)
+    elif total_vram_gb < 10.0:
+        eval_batch_size = min(eval_batch_size, 64)
+    elif total_vram_gb < 16.0:
+        eval_batch_size = min(eval_batch_size, 128)
+    else:
+        eval_batch_size = min(eval_batch_size, 256)
+
+val_dl = DataLoader(val_ds, batch_size=eval_batch_size, shuffle=False, num_workers=0)
 print(f"Val samples: {len(val_ds)}, classes: {val_ds.classes}")
 
 model = DNN().to(device)
@@ -124,5 +167,5 @@ lines.append(f"\nOverall: {correct.sum()/total.sum()*100:.1f}%  ({int(correct.su
 
 output = "\n".join(lines)
 print(output)
-with open(os.path.join(os.path.dirname(__file__), 'eval_result.txt'), 'w') as f:
+with open(os.path.join(result_dir, 'eval_result.txt'), 'w') as f:
     f.write(output)

@@ -19,6 +19,11 @@ from tqdm import tqdm
 import json
 import sys
 
+# Setup global debug.log redirection if not in a terminal
+# Wait, we want to write EVERYTHING to debug.log in the result directory.
+# But the result directory is not created until `train()` is called.
+# Let's redirect inside `train()` or after `save_dir` is created.
+
 # Load Config
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(BASE_DIR, 'config.json')
@@ -30,11 +35,35 @@ if os.path.exists(config_path):
 else:
     print(f"Config not found at {config_path}, using defaults")
 
+# Intercept for batch training if configured
+if config.get('batch_train', False):
+    print("\n[INFO] 'batch_train' flag is true in config.json. Redirecting to batch_train.py...")
+    import subprocess
+    try:
+        # Run batch_train.py in the same directory
+        subprocess.run([sys.executable, os.path.join(BASE_DIR, 'batch_train.py')], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Batch training failed with code {e.returncode}")
+    sys.exit(0)  # Exit current train.py process since batch_train handles everything
+
 # Constants and Configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print('Using Device: ', device)
 
 BATCH_SIZE = config.get('batch_size', 48)
+
+# Auto-adjust BATCH_SIZE for training based on VRAM to prevent OOM
+if torch.cuda.is_available():
+    total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    if total_vram_gb < 6.0:
+        BATCH_SIZE = min(BATCH_SIZE, 32)
+    elif total_vram_gb < 10.0:
+        BATCH_SIZE = min(BATCH_SIZE, 64)
+    elif total_vram_gb < 16.0:
+        BATCH_SIZE = min(BATCH_SIZE, 128)
+    # else keep config's BATCH_SIZE (could be 256 or higher)
+    print(f"Auto-adjusted training BATCH_SIZE to {BATCH_SIZE} based on {total_vram_gb:.1f}GB VRAM.")
+
 IMG_SIZE = config.get('img_size', [1000, 1000])
 PhaseMask = config.get('phase_mask_size', [1200, 1200])
 PIXEL_SIZE = config.get('pixel_size', 8e-6)
@@ -420,7 +449,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         f.write("="*50 + "\n")
         f.write("Epoch | Train Loss | Train Acc | Val Loss | Val Acc | LR | Time(s) | Status\n")
         f.write("-" * 80 + "\n")
-    
+        
     start_time = time.time()
 
     def compute_loss(images, labels, out_img, output_vec):
@@ -722,23 +751,148 @@ if __name__ == "__main__":
         
         print(f"Time taken (1 epoch): {time_1:.2f}s")
 
+        # Use the global save_dir initialized in train function.
+        # We need to construct it here since we are in __main__ and time_1 only returns elapsed time.
+        # The best way is to fetch the latest created folder that matches exp_name
+        results_dir_final = config.get('results_dir', 'results')
+        if not os.path.isabs(results_dir_final):
+            results_dir_final = os.path.join(BASE_DIR, results_dir_final)
+            
+        import glob
+        # Find the specific experiment directory just created
+        possible_dirs = glob.glob(os.path.join(results_dir_final, f"{exp_name}_*"))
+        if possible_dirs:
+            possible_dirs.sort(key=os.path.getmtime, reverse=True)
+            target_save_dir = possible_dirs[0]
+        else:
+            # Fallback to results_dir root if we can't find the specific one
+            target_save_dir = results_dir_final
+            
+        debug_log_path = os.path.join(target_save_dir, 'debug.log')
+        
+        # Setup global debug.log redirection if not in a terminal
+        # This will capture ALL print statements from this point forward (including subprocess outputs if printed)
+        class LoggerWriter:
+            def __init__(self, filename, stream):
+                self.filename = filename
+                self.stream = stream
+            def write(self, message):
+                self.stream.write(message)
+                self.stream.flush()
+                with open(self.filename, 'a', encoding='utf-8') as log_file:
+                    log_file.write(message)
+            def flush(self):
+                self.stream.flush()
+
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = LoggerWriter(debug_log_path, sys.stdout)
+        sys.stderr = LoggerWriter(debug_log_path, sys.stderr)
+
         # Run Evaluation if configured
         if config.get("run_evaluate_after_train", True):
             print("\n--- Running Evaluation ---")
             # Run as a subprocess to avoid context/memory issues and ensure it works cross-platform
             import subprocess
+            
+            # Determine capture mode based on debug flag
+            debug_eval = config.get("debug_eval_subprocess", False)
+            
             try:
-                subprocess.run([sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], check=True)
+                if debug_eval:
+                    log_msg = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluate.py...\n"
+                    # Print to terminal
+                    print(log_msg.strip())
+                    
+                    result = subprocess.run(
+                        [sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], 
+                        check=False,
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    print(log_msg)
+                    print(f"Return code: {result.returncode}")
+                    print(f"STDOUT:\n{result.stdout}")
+                    print(f"STDERR:\n{result.stderr}")
+                    print("-" * 50)
+                        
+                    if result.returncode != 0:
+                        err_msg = f"Evaluation script failed with code {result.returncode}. See {debug_log_path} for details."
+                        print(err_msg)
+                else:
+                    # Redirect output to debug.log when not in debug mode (silent mode)
+                    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluate.py (silent mode)...")
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], 
+                            check=True,
+                            capture_output=True,
+                            text=True
+                        )
+                        print("Evaluation completed successfully.")
+                    except subprocess.CalledProcessError as e:
+                        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Evaluation failed with code {e.returncode}")
+                        print(f"STDOUT: {e.stdout}")
+                        print(f"STDERR: {e.stderr}")
+                        raise e
             except subprocess.CalledProcessError as e:
                 print(f"Evaluation script failed: {e}")
+                # We already wrote to debug.log in the except block above or it was captured
+            except Exception as e:
+                print(f"Evaluation script failed to start: {e}")
             
         # Archive Results
         print("\n--- Archiving Results ---")
         try:
             import subprocess
-            subprocess.run([sys.executable, os.path.join(BASE_DIR, 'archive_results.py')], check=True)
+            
+            debug_eval = config.get("debug_eval_subprocess", False)
+            if debug_eval:
+                log_msg = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running archive_results.py...\n"
+                print(log_msg.strip())
+                
+                result = subprocess.run(
+                    [sys.executable, os.path.join(BASE_DIR, 'archive_results.py')], 
+                    check=False,
+                    capture_output=True,
+                    text=True
+                )
+                
+                print(log_msg)
+                print(f"Return code: {result.returncode}")
+                print(f"STDOUT:\n{result.stdout}")
+                print(f"STDERR:\n{result.stderr}")
+                print("-" * 50)
+                    
+                if result.returncode != 0:
+                    err_msg = f"Archiving script failed with code {result.returncode}. See {debug_log_path} for details."
+                    print(err_msg)
+                        
+            else:
+                # Redirect output to debug.log when not in debug mode (silent mode)
+                print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running archive_results.py (silent mode)...")
+                try:
+                    result = subprocess.run(
+                        [sys.executable, os.path.join(BASE_DIR, 'archive_results.py')], 
+                        check=True,
+                        capture_output=True,
+                        text=True
+                    )
+                    print("Archiving completed successfully.")
+                    if result.stdout:
+                        print(result.stdout)
+                except subprocess.CalledProcessError as e:
+                    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Archiving failed with code {e.returncode}")
+                    print(f"STDOUT: {e.stdout}")
+                    print(f"STDERR: {e.stderr}")
+                    raise e
         except Exception as e:
             print(f"Archiving script failed: {e}")
+            
+        # Restore original stdout/stderr
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
         
     except Exception as e:
         print(f"Error: {e}")
