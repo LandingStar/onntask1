@@ -1,11 +1,6 @@
 {
-    "batch_train": false,
-    "epochs": 100,    
-    "learning_rate": 0.0001,
-    "label_num": 20,
-    "run_evaluate_after_train": true,
-    "debug_eval_subprocess": true,
     "batch_size": 256,
+    "batch_train": true,
     "img_size": [
         1000,
         1000
@@ -20,9 +15,12 @@
     "distance_to_detectors": 0.2,
     "num_layers": 1,
     "num_classes": 5,
+    "label_num": 20,
     "strict_accuracy_ratio": 0,
     "minus_mask_ratio": 0,
-    "scheduler_patience": 10,
+    "epochs": 1,
+    "learning_rate": 0.0001,
+    "scheduler_patience": 4,
     "scheduler_factor": 0.5,
     "scheduler_min_lr": 1e-06,
     "dataset_path": "./continue5",
@@ -40,7 +38,7 @@
         1.07,
         1.2,
         1.05,
-        0.85
+        0.8
     ],
     "use_blur_background_loss": true,
     "blur_kernel_size": 21,
@@ -57,8 +55,10 @@
     "phase_noise_relative": 0.05,
     "exp_name": "floating_5det_wide",
     "save_csv_logs": false,
+    "debug_eval_subprocess": true,
     "inherit_best_model": false,
     "results_dir": "results",
+    "run_evaluate_after_train": true,
     "detector_pos": [
         [
             600.0,
@@ -80,5 +80,5 @@
             239.0,
             600.0
         ]
-    ]    
+    ]
 }

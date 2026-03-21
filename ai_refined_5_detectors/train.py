@@ -801,7 +801,7 @@ if __name__ == "__main__":
             try:
                 if debug_eval:
                     log_msg = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluate.py...\n"
-                    # Print to terminal
+                    # Print to terminal, which will be caught by LoggerWriter and written to debug.log
                     print(log_msg.strip())
                     
                     result = subprocess.run(
@@ -811,34 +811,31 @@ if __name__ == "__main__":
                         text=True
                     )
                     
-                    print(log_msg)
+                    # Print captured output so LoggerWriter can write it to debug.log
                     print(f"Return code: {result.returncode}")
                     print(f"STDOUT:\n{result.stdout}")
                     print(f"STDERR:\n{result.stderr}")
                     print("-" * 50)
                         
                     if result.returncode != 0:
-                        err_msg = f"Evaluation script failed with code {result.returncode}. See {debug_log_path} for details."
-                        print(err_msg)
+                        print(f"Evaluation script failed with code {result.returncode}. See {debug_log_path} for details.")
                 else:
-                    # Redirect output to debug.log when not in debug mode (silent mode)
+                    # Silent mode: redirect subprocess output directly to debug.log
                     print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluate.py (silent mode)...")
-                    try:
-                        result = subprocess.run(
-                            [sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], 
-                            check=True,
-                            capture_output=True,
-                            text=True
-                        )
-                        print("Evaluation completed successfully.")
-                    except subprocess.CalledProcessError as e:
-                        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Evaluation failed with code {e.returncode}")
-                        print(f"STDOUT: {e.stdout}")
-                        print(f"STDERR: {e.stderr}")
-                        raise e
+                    with open(debug_log_path, 'a', encoding='utf-8') as f_log:
+                        try:
+                            result = subprocess.run(
+                                [sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], 
+                                check=True,
+                                stdout=f_log,
+                                stderr=subprocess.STDOUT
+                            )
+                            print("Evaluation completed successfully.")
+                        except subprocess.CalledProcessError as e:
+                            print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Evaluation failed with code {e.returncode}")
+                            raise e
             except subprocess.CalledProcessError as e:
                 print(f"Evaluation script failed: {e}")
-                # We already wrote to debug.log in the except block above or it was captured
             except Exception as e:
                 print(f"Evaluation script failed to start: {e}")
             
@@ -859,34 +856,28 @@ if __name__ == "__main__":
                     text=True
                 )
                 
-                print(log_msg)
                 print(f"Return code: {result.returncode}")
                 print(f"STDOUT:\n{result.stdout}")
                 print(f"STDERR:\n{result.stderr}")
                 print("-" * 50)
                     
                 if result.returncode != 0:
-                    err_msg = f"Archiving script failed with code {result.returncode}. See {debug_log_path} for details."
-                    print(err_msg)
+                    print(f"Archiving script failed with code {result.returncode}. See {debug_log_path} for details.")
                         
             else:
-                # Redirect output to debug.log when not in debug mode (silent mode)
                 print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running archive_results.py (silent mode)...")
-                try:
-                    result = subprocess.run(
-                        [sys.executable, os.path.join(BASE_DIR, 'archive_results.py')], 
-                        check=True,
-                        capture_output=True,
-                        text=True
-                    )
-                    print("Archiving completed successfully.")
-                    if result.stdout:
-                        print(result.stdout)
-                except subprocess.CalledProcessError as e:
-                    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Archiving failed with code {e.returncode}")
-                    print(f"STDOUT: {e.stdout}")
-                    print(f"STDERR: {e.stderr}")
-                    raise e
+                with open(debug_log_path, 'a', encoding='utf-8') as f_log:
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, os.path.join(BASE_DIR, 'archive_results.py')], 
+                            check=True,
+                            stdout=f_log,
+                            stderr=subprocess.STDOUT
+                        )
+                        print("Archiving completed successfully.")
+                    except subprocess.CalledProcessError as e:
+                        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Archiving failed with code {e.returncode}")
+                        raise e
         except Exception as e:
             print(f"Archiving script failed: {e}")
             
