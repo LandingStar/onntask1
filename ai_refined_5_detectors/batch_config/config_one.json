@@ -51,7 +51,7 @@
     "soft_label_offset": 0.25,
     "soft_label_temperature": 0.5,
     "phase_noise_relative": 0.05,
-    "exp_name": "floating_5det_wide",
+    "exp_name": "floating_5det_one",
     "save_csv_logs": false,
     "debug_eval_subprocess": true,
     "inherit_best_model": false,

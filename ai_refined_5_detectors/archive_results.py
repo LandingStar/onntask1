@@ -4,7 +4,7 @@ import zipfile
 import re
 from datetime import datetime
 
-def archive_and_cleanup(results_dir, keep_recent=3, keep_total=15):
+def archive_and_cleanup(results_dir, keep_recent=3, keep_total=10):
     """
     Archives older training results and cleans up very old ones.
     
