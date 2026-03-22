@@ -16,8 +16,6 @@ import torchvision
 import torchvision.transforms.v2 as v2
 
 # 3. Others
-import seaborn as sns
-from sklearn.metrics import confusion_matrix
 
 # 4. Local imports
 from train import DNN, cpu_transform
@@ -478,7 +476,24 @@ def evaluate():
                         normalize='index') # Normalize by row (True Label)
     
     plt.figure(figsize=(10, 12))
-    sns.heatmap(df_cm, annot=True, fmt='.2f', cmap='Blues')
+    
+    # 替代 seaborn.heatmap 的纯 matplotlib 实现
+    cm_data = df_cm.values
+    plt.imshow(cm_data, interpolation='nearest', cmap='Blues', aspect='auto')
+    plt.colorbar()
+    
+    # 添加数值标签 (等同于 annot=True)
+    thresh = cm_data.max() / 2.
+    for i in range(cm_data.shape[0]):
+        for j in range(cm_data.shape[1]):
+            plt.text(j, i, format(cm_data[i, j], '.2f'),
+                     ha="center", va="center",
+                     color="white" if cm_data[i, j] > thresh else "black")
+                     
+    # 设置坐标轴刻度
+    plt.xticks(np.arange(cm_data.shape[1]), df_cm.columns)
+    plt.yticks(np.arange(cm_data.shape[0]), df_cm.index)
+    
     plt.xlabel('Predicted Bin (0-4)')
     plt.ylabel('True Label (0-19)')
     plt.title('Confusion Matrix (Row Normalized)')
