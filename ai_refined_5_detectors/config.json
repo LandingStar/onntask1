@@ -1,6 +1,7 @@
 {
-    "batch_train": false,
+    "batch_train": true,
     "epochs": 100,
+    "transform_intensity": 0.2,
     "batch_size": 256,
     "img_size": [
         1000,

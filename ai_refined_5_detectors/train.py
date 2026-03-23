@@ -114,20 +114,43 @@ cpu_transform = v2.Compose([
     v2.Grayscale(num_output_channels=1),
 ])
 
-gpu_transform = v2.Compose([
-    v2.RandomRotation(degrees=1),
-    v2.RandomAffine(
-        degrees=0, 
-        translate=(0.03, 0.03),
-        scale=(0.97, 1.03), 
-        shear=None
-    ),
-    #v2.ElasticTransform(alpha=100.0, sigma=5.0),
-    v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]),
-    v2.ColorJitter(brightness=0.4, contrast=0.4),
-    v2.RandomPerspective(distortion_scale=0.2, p=0.3),
-    v2.RandomAdjustSharpness(sharpness_factor=2.0, p=0.5),
-])
+# Read transform intensity from config, default to 1.0
+transform_intensity = config.get('transform_intensity', 1.0)
+
+# Build transform list conditionally
+gpu_transform_list = []
+
+if transform_intensity > 0:
+    # Scale parameters according to intensity
+    # Base values
+    base_rotation = 1
+    base_translate = 0.03
+    base_scale_range = 0.03
+    base_jitter = 0.4
+    base_perspective_scale = 0.2
+    base_perspective_p = 0.3
+    base_sharpness_factor = 2.0
+    base_sharpness_p = 0.5
+    
+    gpu_transform_list.extend([
+        v2.RandomRotation(degrees=base_rotation * transform_intensity),
+        v2.RandomAffine(
+            degrees=0, 
+            translate=(base_translate * transform_intensity, base_translate * transform_intensity),
+            scale=(1.0 - base_scale_range * transform_intensity, 1.0 + base_scale_range * transform_intensity), 
+            shear=None
+        ),
+        v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]),
+        v2.ColorJitter(brightness=base_jitter * transform_intensity, contrast=base_jitter * transform_intensity),
+        v2.RandomPerspective(distortion_scale=min(1.0, base_perspective_scale * transform_intensity), p=min(1.0, base_perspective_p * transform_intensity)),
+        # Sharpness factor 1.0 is no change, so we scale the difference from 1.0
+        v2.RandomAdjustSharpness(sharpness_factor=1.0 + (base_sharpness_factor - 1.0) * transform_intensity, p=min(1.0, base_sharpness_p * transform_intensity)),
+    ])
+else:
+    # If intensity is 0, only apply padding
+    gpu_transform_list.append(v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]))
+
+gpu_transform = v2.Compose(gpu_transform_list)
 
 # Diffractive Layer
 class Diffractive_Layer(torch.nn.Module):
