@@ -6,5 +6,6 @@
     "label_num": 20,
     "run_evaluate_after_train": true,
     "debug_eval_subprocess": true,
-    "transform_intensity": 0.2
+    "transform_intensity": 0.2,
+    "scheduler_patience": 5
 }

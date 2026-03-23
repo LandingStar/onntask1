@@ -17,8 +17,6 @@
     "label_num": 20,
     "strict_accuracy_ratio": 0,
     "minus_mask_ratio": 0,
-    "learning_rate": 0.0001,
-    "scheduler_patience": 10,
     "scheduler_factor": 0.5,
     "scheduler_min_lr": 1e-06,
     "dataset_path": "./continue5",
