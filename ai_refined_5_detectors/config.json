@@ -1,5 +1,6 @@
 {
     "batch_train": false,
+    "epochs": 100,
     "batch_size": 256,
     "img_size": [
         1000,
