@@ -82,5 +82,5 @@
             600.0
         ]
     ],
-    "batch_train": false
+    "batch_train": true
 }
