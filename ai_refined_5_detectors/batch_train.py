@@ -25,6 +25,9 @@ CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
 TRAIN_SCRIPT = os.path.join(BASE_DIR, 'train.py')
 OVERALL_CONFIG_NAME = 'overall_config.json'
 
+# Directory for storing temporary generated configs
+TEMP_CONFIG_DIR = os.path.join(BASE_DIR, '.temp_batch_configs')
+
 # Keys reserved for batch_train control (not merged into training configs)
 BATCH_KEYS = {'max_parallel'}
 
@@ -76,8 +79,11 @@ def run_one(cfg_file, shared_params, idx, total):
         print(f"  [{idx}/{total}] ERROR: Invalid JSON in {cfg_file}: {e}")
         return (cfg_file, 'SKIPPED', 'Invalid JSON')
 
-    # Write merged config to a unique temp file (safe for parallel)
-    tmp_config = os.path.join(BASE_DIR, f'.config_batch_{idx}.json')
+    # Ensure temp directory exists
+    os.makedirs(TEMP_CONFIG_DIR, exist_ok=True)
+
+    # Write merged config to a unique temp file in the temp directory
+    tmp_config = os.path.join(TEMP_CONFIG_DIR, f'config_batch_{idx}.json')
     with open(tmp_config, 'w') as f:
         json.dump(merged, f, indent=4)
 
@@ -87,9 +93,8 @@ def run_one(cfg_file, shared_params, idx, total):
 
     start_time = time.time()
     try:
-        shutil.copy2(tmp_config, CONFIG_PATH)
         proc = subprocess.run(
-            [sys.executable, TRAIN_SCRIPT],
+            [sys.executable, TRAIN_SCRIPT, tmp_config],
             cwd=BASE_DIR,
         )
         elapsed = time.time() - start_time
@@ -116,11 +121,6 @@ def main():
 
     total = len(config_files)
 
-    # Backup original config.json
-    backup_path = CONFIG_PATH + '.bak'
-    if os.path.exists(CONFIG_PATH):
-        shutil.copy2(CONFIG_PATH, backup_path)
-
     if shared_params:
         print(f"Shared params from {OVERALL_CONFIG_NAME}:")
         for k, v in shared_params.items():
@@ -132,26 +132,28 @@ def main():
 
     results = []
 
-    if max_parallel <= 1:
-        for idx, cfg_file in enumerate(config_files, 1):
-            result = run_one(cfg_file, shared_params, idx, total)
-            results.append(result)
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
-            futures = {}
+    try:
+        if max_parallel <= 1:
             for idx, cfg_file in enumerate(config_files, 1):
-                future = executor.submit(run_one, cfg_file, shared_params, idx, total)
-                futures[future] = cfg_file
-            for future in concurrent.futures.as_completed(futures):
-                results.append(future.result())
-        order = {name: i for i, name in enumerate(config_files)}
-        results.sort(key=lambda r: order.get(r[0], 0))
-
-    # Restore original config.json
-    if os.path.exists(backup_path):
-        shutil.copy2(backup_path, CONFIG_PATH)
-        os.remove(backup_path)
-        print(f"\nOriginal config.json restored.")
+                result = run_one(cfg_file, shared_params, idx, total)
+                results.append(result)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
+                futures = {}
+                for idx, cfg_file in enumerate(config_files, 1):
+                    future = executor.submit(run_one, cfg_file, shared_params, idx, total)
+                    futures[future] = cfg_file
+                for future in concurrent.futures.as_completed(futures):
+                    results.append(future.result())
+            order = {name: i for i, name in enumerate(config_files)}
+            results.sort(key=lambda r: order.get(r[0], 0))
+    finally:
+        # Clean up temp directory if empty or delete entirely
+        if os.path.exists(TEMP_CONFIG_DIR):
+            try:
+                shutil.rmtree(TEMP_CONFIG_DIR)
+            except Exception as e:
+                print(f"Warning: Could not remove temporary config directory {TEMP_CONFIG_DIR}: {e}")
 
     # Summary
     print(f"\n{'='*60}")

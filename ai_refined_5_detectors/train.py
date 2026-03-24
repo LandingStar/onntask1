@@ -27,6 +27,15 @@ import sys
 # Load Config
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(BASE_DIR, 'config.json')
+
+# Check if a custom config path was passed as an argument
+if len(sys.argv) > 1 and sys.argv[1].endswith('.json'):
+    custom_config = sys.argv[1]
+    if os.path.isabs(custom_config):
+        config_path = custom_config
+    else:
+        config_path = os.path.join(BASE_DIR, custom_config)
+
 config = {}
 if os.path.exists(config_path):
     with open(config_path, 'r') as f:
