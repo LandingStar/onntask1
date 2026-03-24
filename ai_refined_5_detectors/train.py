@@ -692,7 +692,11 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         test_acc_hist.append(test_acc)
         
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(avg_test_loss)
+            scheduler_metric = config.get('scheduler_metric', 'acc')
+            if scheduler_metric == 'acc':
+                scheduler.step(test_acc)
+            else:
+                scheduler.step(avg_test_loss)
         else:
             scheduler.step()
             
@@ -757,7 +761,11 @@ if __name__ == "__main__":
         
         lr = config.get('learning_rate', 0.001)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
+        
+        scheduler_metric = config.get('scheduler_metric', 'acc')
+        scheduler_mode = 'max' if scheduler_metric == 'acc' else 'min'
+        scheduler_patience = config.get('scheduler_patience', 4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode=scheduler_mode, factor=0.5, patience=scheduler_patience)
         
         epochs = config.get('epochs', 5)
         num_classes = config.get('num_classes', 5)
