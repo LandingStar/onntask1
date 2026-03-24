@@ -41,7 +41,7 @@
     "blur_sigma": 5.0,
     "blur_background_loss_weight": 20.0,
     "use_spatial_mask_loss": true,
-    "spatial_mask_loss_weight": 600.0,
+    "spatial_mask_loss_weight": 1600.0,
     "spatial_mask_sigma": 15.0,
     "use_intensity_ratio_loss": true,
     "intensity_ratio_loss_weight": 0.1,
