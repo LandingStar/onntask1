@@ -93,8 +93,11 @@ def run_one(cfg_file, shared_params, idx, total):
 
     start_time = time.time()
     try:
+        cmd = [sys.executable, TRAIN_SCRIPT, tmp_config, "--is-subprocess"]
+        print(f"  [{idx}/{total}] Launching: {' '.join(cmd)}")
+        
         proc = subprocess.run(
-            [sys.executable, TRAIN_SCRIPT, tmp_config],
+            cmd,
             cwd=BASE_DIR,
         )
         elapsed = time.time() - start_time
@@ -111,12 +114,13 @@ def run_one(cfg_file, shared_params, idx, total):
 
 
 def main():
+    print(f"\n[BATCH INIT] Starting batch_train.py")
     batch_opts, shared_params = load_overall_config()
     max_parallel = batch_opts.get('max_parallel', 1)
 
     config_files = get_config_files()
     if not config_files:
-        print("No training config files found in batch_config/. Nothing to do.")
+        print("[BATCH INIT] No training config files found in batch_config/. Nothing to do.")
         return
 
     total = len(config_files)

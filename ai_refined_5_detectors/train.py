@@ -30,27 +30,36 @@ config_path = os.path.join(BASE_DIR, 'config.json')
 
 # Check if a custom config path was passed as an argument
 is_custom_config = False
-if len(sys.argv) > 1 and sys.argv[1].endswith('.json'):
-    custom_config = sys.argv[1]
-    if os.path.isabs(custom_config):
-        config_path = custom_config
-    else:
-        config_path = os.path.join(BASE_DIR, custom_config)
-    is_custom_config = True
+is_subprocess = False
+
+# Parse command line arguments
+print(f"\n[INIT] train.py launched with args: {sys.argv}")
+
+for arg in sys.argv[1:]:
+    if arg == "--is-subprocess":
+        is_subprocess = True
+    elif arg.endswith('.json'):
+        custom_config = arg
+        if os.path.isabs(custom_config):
+            config_path = custom_config
+        else:
+            config_path = os.path.join(BASE_DIR, custom_config)
+        is_custom_config = True
+
+print(f"[INIT] is_subprocess: {is_subprocess}, is_custom_config: {is_custom_config}")
 
 config = {}
 if os.path.exists(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
-    print(f"Loaded config from {config_path}")
+    print(f"[INIT] Loaded config from {config_path}")
 else:
-    print(f"Config not found at {config_path}, using defaults")
+    print(f"[INIT] Config not found at {config_path}, using defaults")
 
 # Intercept for batch training if configured
-# BUT ONLY IF we are reading the default config.json. 
-# If we are reading a custom temp config from batch_train.py, we MUST NOT intercept again.
-if config.get('batch_train', False) and not is_custom_config:
-    print("\n[INFO] 'batch_train' flag is true in config.json. Redirecting to batch_train.py...")
+# BUT ONLY IF we are reading the default config.json AND we are not a subprocess.
+if config.get('batch_train', False) and not is_subprocess:
+    print(f"\n[INFO] 'batch_train' flag is true in config.json. Redirecting to batch_train.py...")
     import subprocess
     try:
         # Run batch_train.py in the same directory
