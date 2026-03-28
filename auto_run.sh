@@ -8,7 +8,7 @@ LOG_FILE="auto_run.log"
 # Navigate to the correct directory (assuming the script is run from or near task1)
 # We use the script's directory as the base to ensure relative paths work
 cd "$(dirname "$0")"
-
+git config --global --add safe.directory /public/home/landingstar/onn_training/onntask1
 # Initialize or clear the log file
 echo "=== Auto Pull and Run Script Started at $(date) ===" > "$LOG_FILE"
 
