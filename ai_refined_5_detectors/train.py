@@ -10,7 +10,6 @@ import os
 import time
 import torch
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 import torchvision
 from torchvision import transforms
@@ -455,9 +454,10 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         # Don't save batch_train=False if it was originally true, but it's safe to just dump current
         json.dump(config, f, indent=4)
         
-    # Initialize TensorBoard SummaryWriter
-    tb_log_dir = os.path.join(save_dir, 'tb_logs')
-    writer = SummaryWriter(log_dir=tb_log_dir)
+    # Setup CSV logger for metrics
+    metrics_csv_path = os.path.join(save_dir, 'metrics.csv')
+    with open(metrics_csv_path, 'w') as f:
+        f.write("epoch,train_loss,val_loss,train_acc,val_acc,learning_rate\n")
     
     train_loss_hist = []
     test_loss_hist = []
@@ -743,12 +743,9 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         epoch_time = time.time() - epoch_start_time
         current_lr = optimizer.param_groups[0]['lr']
         
-        # Log to TensorBoard
-        writer.add_scalar('Loss/Train', avg_train_loss, epoch + 1)
-        writer.add_scalar('Loss/Validation', avg_test_loss, epoch + 1)
-        writer.add_scalar('Accuracy/Train', train_acc, epoch + 1)
-        writer.add_scalar('Accuracy/Validation', test_acc, epoch + 1)
-        writer.add_scalar('Learning_Rate', current_lr, epoch + 1)
+        # Log metrics to CSV
+        with open(metrics_csv_path, 'a') as f:
+            f.write(f"{epoch + 1},{avg_train_loss:.6f},{avg_test_loss:.6f},{train_acc:.6f},{test_acc:.6f},{current_lr:.2e}\n")
         
         # Write to log file
         with open(log_file_path, "a") as f:
@@ -771,8 +768,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         f.write("-" * 80 + "\n")
         f.write(f"Total training time: {elapsed_time:.2f} seconds\n")
         f.write(f"Best Validation Accuracy: {best_acc:.6f}\n")
-        
-    writer.close()
         
     return elapsed_time
 

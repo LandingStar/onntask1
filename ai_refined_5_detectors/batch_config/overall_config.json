@@ -1,6 +1,6 @@
 {
     "max_parallel": 1,
-
+    "batch_size": 64,
     "epochs": 100,
     "learning_rate": 0.001,
     "label_num": 20,
