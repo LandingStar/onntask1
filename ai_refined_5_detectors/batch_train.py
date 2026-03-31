@@ -109,8 +109,10 @@ def run_one(cfg_file, shared_params, idx, total):
         print(f"  [{idx}/{total}] ERROR: {e}")
         return (cfg_file, 'ERROR', str(e))
     finally:
-        if os.path.exists(tmp_config):
-            os.remove(tmp_config)
+        # Keep temp configs around for debugging if needed, or selectively remove them
+        # Previously this was: os.remove(tmp_config)
+        # But we'll leave it out for a moment to ensure it's not being deleted prematurely by concurrent runs
+        pass
 
 
 def main():

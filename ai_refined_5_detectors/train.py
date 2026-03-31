@@ -63,11 +63,12 @@ if config.get('batch_train', False) and not is_subprocess:
     import subprocess
     try:
         # Run batch_train.py in the same directory
-        subprocess.run([sys.executable, os.path.join(BASE_DIR, 'batch_train.py')], check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Batch training failed with code {e.returncode}")
-        sys.exit(e.returncode)
-    sys.exit(0)  # Exit current train.py process since batch_train handles everything
+        result = subprocess.run([sys.executable, os.path.join(BASE_DIR, 'batch_train.py')], check=False)
+        sys.exit(result.returncode)
+    except Exception as e:
+        print(f"Batch training execution failed: {e}")
+        sys.exit(1)
+    # The script should always exit here because batch_train handles all the runs
 
 # Constants and Configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -132,7 +133,6 @@ print(f"Dataset path: {dataset_name}")
 # Transforms
 cpu_transform = v2.Compose([
     v2.ToImage(),
-    v2.Resize((IMG_SIZE[0], IMG_SIZE[1]), antialias=True),
     v2.ToDtype(torch.float32, scale=True),
     v2.Grayscale(num_output_channels=1),
 ])
@@ -141,7 +141,13 @@ cpu_transform = v2.Compose([
 transform_intensity = config.get('transform_intensity', 1.0)
 
 # Build transform list conditionally
-gpu_transform_list = []
+gpu_transform_train_list = [
+    v2.Resize((IMG_SIZE[0], IMG_SIZE[1]), antialias=True)
+]
+
+gpu_transform_val = v2.Compose([
+    v2.Resize((IMG_SIZE[0], IMG_SIZE[1]), antialias=True)
+])
 
 if transform_intensity > 0:
     # Scale parameters according to intensity
@@ -155,7 +161,7 @@ if transform_intensity > 0:
     base_sharpness_factor = 2.0
     base_sharpness_p = 0.5
     
-    gpu_transform_list.extend([
+    gpu_transform_train_list.extend([
         v2.RandomRotation(degrees=base_rotation * transform_intensity),
         v2.RandomAffine(
             degrees=0, 
@@ -171,9 +177,9 @@ if transform_intensity > 0:
     ])
 else:
     # If intensity is 0, only apply padding
-    gpu_transform_list.append(v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]))
+    gpu_transform_train_list.append(v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]))
 
-gpu_transform = v2.Compose(gpu_transform_list)
+gpu_transform = v2.Compose(gpu_transform_train_list)
 
 # Diffractive Layer
 class Diffractive_Layer(torch.nn.Module):
@@ -695,15 +701,23 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         
         with torch.no_grad():
             for images, labels in testloader:
-                images = images.to(device)
+                images = images.to(device).float()
+                
+                # Apply validation transforms on GPU (Resize)
+                images_aug = gpu_transform_val(images)
+                
                 labels = labels.to(device)
                 
-                if images.shape[1] == 1:
-                    images_squeezed = images.squeeze(1)
+                if images_aug.shape[1] == 1:
+                    images_squeezed = images_aug.squeeze(1)
                 else:
-                    images_squeezed = images
+                    images_squeezed = images_aug
                     
-                images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
+                if images_squeezed.shape[-1] == PhaseMask[0]:
+                    images_input = images_squeezed
+                else:
+                    images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
+                    
                 out_label, out_img, penalty_per_det = model(images_input)
                 
                 loss = compute_loss(images_input, labels, out_img, out_label)
@@ -736,6 +750,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         status_msg = ""
         if test_acc > best_acc:
             best_acc = test_acc
+            # Note: Saving a model can take a few seconds depending on I/O speed.
             torch.save(model.state_dict(), f"{save_dir}/best_model.pth")
             print(f"Saved best model with acc: {best_acc:.6f}")
             status_msg = "Best Model Saved"
@@ -751,15 +766,22 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         with open(log_file_path, "a") as f:
             f.write(f"{epoch+1:5d} | {avg_train_loss:10.6f} | {train_acc:9.4f} | {avg_test_loss:8.6f} | {test_acc:7.4f} | {current_lr:.2e} | {epoch_time:7.2f} | {status_msg}\n")
         
-        # Plotting
-        plot_loss_acc(train_loss_hist, test_loss_hist, train_acc_hist, test_acc_hist, f"{save_dir}/loss_acc.png")
+        # Plotting - move to a background thread to prevent blocking the next epoch
+        import threading
+        plot_thread = threading.Thread(
+            target=plot_loss_acc, 
+            args=(list(train_loss_hist), list(test_loss_hist), list(train_acc_hist), list(test_acc_hist), f"{save_dir}/loss_acc.png")
+        )
+        plot_thread.start()
         
         # Save Outputs (if configured)
         if config.get("save_csv_logs", False):
-            csv_log_dir = f"{save_dir}/csv_logs"
-            os.makedirs(csv_log_dir, exist_ok=True)
-            np.savetxt(f"{csv_log_dir}/mask_epoch_{epoch+1}.csv", model.phase_mask[0].detach().cpu().numpy(), delimiter=",")
-            np.savetxt(f"{csv_log_dir}/detector_pos_epoch_{epoch+1}.csv", model.detector_pos.detach().cpu().numpy(), delimiter=",")
+            # Only save CSV logs at the last epoch or if explicitly needed frequently, as np.savetxt is extremely slow
+            if epoch == epochs - 1 or config.get("save_csv_logs_every_epoch", False):
+                csv_log_dir = f"{save_dir}/csv_logs"
+                os.makedirs(csv_log_dir, exist_ok=True)
+                np.savetxt(f"{csv_log_dir}/mask_epoch_{epoch+1}.csv", model.phase_mask[0].detach().cpu().numpy(), delimiter=",")
+                np.savetxt(f"{csv_log_dir}/detector_pos_epoch_{epoch+1}.csv", model.detector_pos.detach().cpu().numpy(), delimiter=",")
 
     elapsed_time = time.time() - start_time
     print(f"Total time for {epochs} epochs: {elapsed_time:.2f} seconds")
@@ -777,8 +799,50 @@ if __name__ == "__main__":
         train_dataset = torchvision.datasets.ImageFolder(f"{dataset_name}/train", transform=cpu_transform)
         val_dataset = torchvision.datasets.ImageFolder(f"{dataset_name}/val", transform=cpu_transform)
         
-        train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
-        val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+        # DataLoader configurations for better performance
+        # Detect available CPU cores
+        try:
+            import multiprocessing
+            cpu_count = multiprocessing.cpu_count()
+        except NotImplementedError:
+            cpu_count = 4
+            
+        # Dynamically allocate workers if not explicitly set in config
+        # Rule of thumb: leave 1-2 cores for OS, split the rest (more for train, fewer for val)
+        # Cap train workers at 8-16 to avoid excessive memory overhead
+        available_workers = max(1, cpu_count - 2)
+        
+        default_train_workers = min(16, max(2, int(available_workers * 0.75)))
+        default_val_workers = max(1, int(available_workers * 0.25))
+        
+        train_num_workers = config.get('train_num_workers', default_train_workers)
+        val_num_workers = config.get('val_num_workers', default_val_workers)
+        
+        print(f"CPU Cores detected: {cpu_count}. Using {train_num_workers} workers for Train, {val_num_workers} for Val.")
+
+        train_prefetch = config.get('prefetch_factor', 2) if train_num_workers > 0 else None
+        val_prefetch = config.get('prefetch_factor', 2) if val_num_workers > 0 else None
+        
+        train_dataloader = DataLoader(
+            train_dataset, 
+            batch_size=BATCH_SIZE, 
+            shuffle=True, 
+            num_workers=train_num_workers, 
+            pin_memory=True,
+            prefetch_factor=train_prefetch,
+            persistent_workers=True if train_num_workers > 0 else False,
+            drop_last=True # Helps with memory alignment and batch processing
+        )
+        val_dataloader = DataLoader(
+            val_dataset, 
+            batch_size=BATCH_SIZE, 
+            shuffle=False, 
+            num_workers=val_num_workers, 
+            pin_memory=True,
+            prefetch_factor=val_prefetch,
+            persistent_workers=True if val_num_workers > 0 else False,
+            drop_last=False
+        )
         
         # Experiment from Config
         exp_name = config.get('exp_name', 'default_run_5det')

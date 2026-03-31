@@ -60,20 +60,25 @@ done
 
 # Execute script if update was successful
 if [ "$success" = true ]; then
-    echo "[INFO] Starting training script: python ai_refined_5_detectors/train.py" >> "$LOG_FILE"
-    echo "---------------------------------------------------" >> "$LOG_FILE"
+    echo "[INFO] Changing directory to ai_refined_5_detectors" >> "$LOG_FILE"
+    cd ai_refined_5_detectors
     
-    # Run the python script and append output to the same log file
-    # 2>&1 redirects stderr to stdout so both go to the log
-    python ai_refined_5_detectors/train.py >> "$LOG_FILE" 2>&1
+    echo "[INFO] Starting training script: python train.py" >> "../$LOG_FILE"
+    echo "---------------------------------------------------" >> "../$LOG_FILE"
+    
+    # Run the python script and append output to the log file in the parent directory
+    python train.py >> "../$LOG_FILE" 2>&1
     
     TRAIN_EXIT_CODE=$?
-    echo "---------------------------------------------------" >> "$LOG_FILE"
+    echo "---------------------------------------------------" >> "../$LOG_FILE"
     if [ $TRAIN_EXIT_CODE -eq 0 ]; then
-        echo "[SUCCESS] Training script completed successfully at $(date)." >> "$LOG_FILE"
+        echo "[SUCCESS] Training script completed successfully at $(date)." >> "../$LOG_FILE"
     else
-        echo "[ERROR] Training script exited with code $TRAIN_EXIT_CODE at $(date)." >> "$LOG_FILE"
+        echo "[ERROR] Training script exited with code $TRAIN_EXIT_CODE at $(date)." >> "../$LOG_FILE"
     fi
+    
+    # Go back to task1 directory
+    cd ..
 else
     echo "[FATAL] Failed to update repository after $MAX_RETRIES attempts. Aborting." >> "$LOG_FILE"
     exit 1
