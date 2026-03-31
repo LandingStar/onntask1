@@ -471,6 +471,13 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     test_acc_hist = []
     best_acc = 0
     
+    # Dynamic Spatial Mask Loss Weight parameters
+    spatial_mask_weight = float(config.get('spatial_mask_loss_weight', 0.05))
+    auto_spatial_weight_on = config.get('auto_spatial_mask_weight', False)
+    target_ratio = config.get('auto_spatial_mask_target_ratio', 0.1)
+    acc_threshold = config.get('auto_spatial_mask_acc_threshold', 0.90)
+    weight_step = config.get('auto_spatial_mask_weight_step', 1.1)
+    
     if label_num >= 2 * num_classes:
         # num_classes += 1 # Disable for 5-detector specific task
         pass
@@ -505,7 +512,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         f.write(f"Experiment: {exp_name}\n")
         f.write(f"Date: {currentDate}\n")
         f.write("="*50 + "\n")
-        f.write("Epoch | Train Loss | Train Acc | Val Loss | Val Acc | LR | Time(s) | Status\n")
+        f.write("Epoch | Train Loss | Train Acc | Val Loss | Val Acc | LR | Int.Ratio | MaskWt | Time(s) | Status\n")
         f.write("-" * 80 + "\n")
         
     start_time = time.time()
@@ -519,18 +526,30 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         current_labels_image_tensors = torch.zeros((classes_num, PhaseMask[0], PhaseMask[1]), device=device, dtype=torch.float32)
         
         det_size = config.get('detector_size', 60)
+        
+        # Calculate sigma based on target encircled energy
+        # For a 2D Gaussian, Integral over [-L/2, L/2] is erf(L / (2*sqrt(2)*sigma))^2
+        target_energy = config.get('target_encircled_energy', 0.8)
+        import scipy.special as sp
+        # Protect against edge cases
+        target_energy = max(1e-4, min(0.9999, target_energy))
+        target_erf = np.sqrt(target_energy)
+        val = sp.erfinv(target_erf)
+        sigma = det_size / (2 * np.sqrt(2) * val)
+        
         for ind, pos in enumerate(model.detector_pos):
             x, y = pos
-            x0 = int(x - det_size/2)
-            x1 = int(x + det_size/2)
-            y0 = int(y - det_size/2)
-            y1 = int(y + det_size/2)
             
-            x0 = max(0, x0); x1 = min(PhaseMask[0], x1)
-            y0 = max(0, y0); y1 = min(PhaseMask[1], y1)
+            # Generate Gaussian Mask
+            grid_x = torch.arange(0, PhaseMask[0], device=device).float()
+            grid_y = torch.arange(0, PhaseMask[1], device=device).float()
+            gx, gy = torch.meshgrid(grid_x, grid_y, indexing='ij')
+            
+            dist_sq = (gx - x)**2 + (gy - y)**2
+            gaussian = torch.exp(-dist_sq / (2 * sigma**2))
             
             if ind < classes_num:
-                current_labels_image_tensors[ind, x0:x1, y0:y1] = 1.0
+                current_labels_image_tensors[ind] = gaussian
                 if current_labels_image_tensors[ind].sum() > 0:
                     current_labels_image_tensors[ind] /= current_labels_image_tensors[ind].sum()
 
@@ -594,7 +613,8 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             loss_vec = F.mse_loss(output_vec[i], target_mask_weight)
             det_weights = config.get('detector_loss_weight', None)
             w = det_weights[base_det] if det_weights else 1.0
-            batch_loss += w * (0.05 * loss + 1.0 * loss_vec)
+            # Use dynamic spatial_mask_weight instead of hardcoded 0.05
+            batch_loss += w * (spatial_mask_weight * loss + 1.0 * loss_vec)
 
         return batch_loss
 
@@ -699,6 +719,9 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         correct = 0
         total = 0
         
+        # To track average intensity ratio in target detector
+        val_target_intensity_sum = 0.0
+        
         with torch.no_grad():
             for images, labels in testloader:
                 images = images.to(device).float()
@@ -728,9 +751,31 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 
                 correct += compute_acc(out_label, labels).sum().item()
                 total += labels.size(0)
+                
+                # Calculate target detector AVERAGE intensity ratio for this batch
+                # out_label is the ratio of integral sum.
+                # To get average intensity: (Detector_Sum / Detector_Area) / (Global_Sum / Global_Area)
+                # Since out_label = Detector_Sum / Global_Sum
+                # Avg_Intensity_Ratio = out_label * (Global_Area / Detector_Area)
+                target_intensities = out_label[torch.arange(len(labels), device=device), target_det]
+                
+                det_shape = config.get('detector_shape', 'circle')
+                det_size_config = config.get('detector_size', 60)
+                if det_shape == 'square':
+                    det_area = det_size_config * det_size_config
+                else: # circle
+                    det_area = np.pi * (det_size_config / 2)**2
+                
+                global_area = PhaseMask[0] * PhaseMask[1]
+                area_ratio = global_area / det_area
+                
+                target_avg_intensity_ratio = target_intensities * area_ratio
+                val_target_intensity_sum += target_avg_intensity_ratio.sum().item()
 
         avg_test_loss = ep_test_loss / len(testloader.dataset)
         test_acc = correct / total
+        avg_target_intensity_ratio = val_target_intensity_sum / total
+        
         test_loss_hist.append(avg_test_loss)
         test_acc_hist.append(test_acc)
         
@@ -746,6 +791,21 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         print(f"Epoch {epoch+1} Results:")
         print(f"Train Loss: {avg_train_loss:.6f} | Train Acc: {train_acc:.6f}")
         print(f"Val Loss: {avg_test_loss:.6f} | Val Acc: {test_acc:.6f}")
+        print(f"Avg Target Intensity Ratio: {avg_target_intensity_ratio:.4f}")
+        
+        # Dynamic Spatial Mask Loss Weight Adjustment
+        if auto_spatial_weight_on:
+            if test_acc >= acc_threshold and avg_target_intensity_ratio < target_ratio:
+                spatial_mask_weight *= weight_step
+                print(f"[*] Acc >= {acc_threshold} but Intensity {avg_target_intensity_ratio:.4f} < {target_ratio}.")
+                print(f"[*] Increasing spatial_mask_loss_weight to: {spatial_mask_weight:.4f}")
+            elif test_acc < (acc_threshold - 0.1):
+                # If accuracy drops significantly, reduce the spatial constraint to let the model recover
+                old_weight = spatial_mask_weight
+                spatial_mask_weight = max(0.001, spatial_mask_weight * 0.9)
+                if old_weight != spatial_mask_weight:
+                    print(f"[*] Acc dropped below {acc_threshold - 0.1:.2f}.")
+                    print(f"[*] Decreasing spatial_mask_loss_weight to: {spatial_mask_weight:.4f}")
         
         status_msg = ""
         if test_acc > best_acc:
@@ -764,7 +824,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         
         # Write to log file
         with open(log_file_path, "a") as f:
-            f.write(f"{epoch+1:5d} | {avg_train_loss:10.6f} | {train_acc:9.4f} | {avg_test_loss:8.6f} | {test_acc:7.4f} | {current_lr:.2e} | {epoch_time:7.2f} | {status_msg}\n")
+            f.write(f"{epoch+1:5d} | {avg_train_loss:10.6f} | {train_acc:9.4f} | {avg_test_loss:8.6f} | {test_acc:7.4f} | {current_lr:.2e} | {avg_target_intensity_ratio:7.4f} | {spatial_mask_weight:7.4f} | {epoch_time:7.2f} | {status_msg}\n")
         
         # Plotting - move to a background thread to prevent blocking the next epoch
         import threading

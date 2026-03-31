@@ -1,0 +1,73 @@
+{
+    "_comment_basic": "=== 基础训练配置 ===",
+    "exp_name": "example_experiment",
+    "batch_train": false,
+    "dataset_path": "./dataset",
+    "results_dir": "results",
+    "epochs": 100,
+    "batch_size": 48,
+    "learning_rate": 0.001,
+    "num_workers": 4,
+    "prefetch_factor": 2,
+
+    "_comment_scheduler": "=== 学习率调度器 (ReduceLROnPlateau) ===",
+    "scheduler_metric": "acc", 
+    "scheduler_patience": 5,
+
+    "_comment_model": "=== 物理光学模型配置 ===",
+    "num_layers": 2,
+    "distance_between_layers": 0.15,
+    "distance_to_detectors": 0.2,
+    "wavelength": 5.32e-07,
+    "pixel_size": 8e-06,
+    "img_size": [1000, 1000],
+    "phase_mask_size": [1200, 1200],
+
+    "_comment_detector": "=== 探测器配置 ===",
+    "num_classes": 5,
+    "label_num": 20,
+    "detector_shape": "circle",
+    "detector_size": 60,
+    "train_detector_pos": true,
+    "train_detector_scale": true,
+    "train_detector_bias": true,
+    "detector_pos": [
+        [823.0, 293.0],
+        [961.0, 483.0],
+        [961.0, 717.0],
+        [600.0, 980.0],
+        [239.0, 717.0]
+    ],
+
+    "_comment_augmentation": "=== 数据增强配置 ===",
+    "transform_intensity": 1.0,
+
+    "_comment_loss_weights": "=== 损失函数与物理约束配置 ===",
+    "detector_loss_weight": [1.0, 1.0, 1.0, 1.0, 1.0],
+    "strict_accuracy_ratio": 1.0,
+    "minus_mask_ratio": 0.0,
+    "edge_penalty_weight": 0.0,
+    "edge_width_ratio": 0.1,
+    "concentration_loss_weight": 0.0,
+
+    "_comment_soft_label": "=== 软标签配置 (相邻类别分流) ===",
+    "soft_label_enabled": false,
+    "soft_label_offset": 0.25,
+    "soft_label_temperature": 0.5,
+
+    "_comment_spatial_mask": "=== 空间掩膜与动态聚焦配置 ===",
+    "target_encircled_energy": 0.8,
+    "spatial_mask_loss_weight": 0.05,
+    
+    "auto_spatial_mask_weight": true,
+    "auto_spatial_mask_target_ratio": 50.0,
+    "auto_spatial_mask_acc_threshold": 0.90,
+    "auto_spatial_mask_weight_step": 1.1,
+
+    "_comment_logging": "=== 日志与保存配置 ===",
+    "inherit_best_model": false,
+    "save_csv_logs": true,
+    "save_csv_logs_every_epoch": false,
+    "run_evaluate_after_train": true,
+    "debug_eval_subprocess": false
+}
