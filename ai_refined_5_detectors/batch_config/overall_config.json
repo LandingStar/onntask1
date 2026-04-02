@@ -1,6 +1,6 @@
 {
     "max_parallel": 1,
-    "batch_size": 64,
+    "batch_size": 256,
     "epochs": 100,
     "learning_rate": 0.001,
     "label_num": 20,
@@ -10,7 +10,7 @@
     "scheduler_patience": 10,
     "scheduler_metric" : "acc",
     "target_encircled_energy": 0.8,
-    "spatial_mask_loss_weight": 0.05,
+    "spatial_mask_loss_weight": 0.1,
     
     "auto_spatial_mask_weight": true,
     "auto_spatial_mask_target_ratio": 50.0,

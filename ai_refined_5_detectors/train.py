@@ -512,6 +512,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     
     current_cooldown = 0
     cooldown_epochs = config.get('auto_spatial_mask_cooldown', 3)
+    has_stepped_up = False
     
     if label_num >= 2 * num_classes:
         # num_classes += 1 # Disable for 5-detector specific task
@@ -875,6 +876,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 # to concentrate energy at the expense of classification loss.
                 if test_acc >= acc_threshold and avg_target_intensity_ratio < target_ratio:
                     spatial_mask_weight *= weight_step
+                    has_stepped_up = True
                     if is_main_process:
                         print(f"[*] Acc ({test_acc:.4f}) >= {acc_threshold} but Intensity ({avg_target_intensity_ratio:.4f}) < {target_ratio}.")
                         print(f"[*] Increasing spatial_mask_loss_weight to: {spatial_mask_weight:.6f}")
@@ -884,7 +886,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                         if is_main_process:
                             print("[*] Resetting lr_scheduler patience to adapt to new loss landscape.")
                     current_cooldown = cooldown_epochs
-                elif test_acc < (acc_threshold - 0.05):
+                elif has_stepped_up and test_acc < (acc_threshold - 0.05):
                     # If accuracy drops significantly, reduce the spatial constraint to let the model recover
                     old_weight = spatial_mask_weight
                     # Only decrease if we are significantly above 0
