@@ -12,6 +12,11 @@ Usage:
     python batch_train.py
 """
 import os
+# Force thread limits BEFORE any other heavy imports to prevent RLIMIT_NPROC explosion in child processes
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import sys
 import json
 import shutil
@@ -29,7 +34,7 @@ OVERALL_CONFIG_NAME = 'overall_config.json'
 TEMP_CONFIG_DIR = os.path.join(BASE_DIR, '.temp_batch_configs')
 
 # Keys reserved for batch_train control (not merged into training configs)
-BATCH_KEYS = {'max_parallel'}
+BATCH_KEYS = {'max_parallel', 'use_ddp', 'nproc_per_node', 'master_port'}
 
 
 def load_overall_config():
@@ -63,7 +68,7 @@ def merge_config(shared_params, individual_path):
     return merged
 
 
-def run_one(cfg_file, shared_params, idx, total):
+def run_one(cfg_file, shared_params, batch_opts, idx, total):
     """Run a single training. Returns (cfg_file, status, detail)."""
     cfg_path = os.path.join(BATCH_CONFIG_DIR, cfg_file)
 
@@ -93,7 +98,22 @@ def run_one(cfg_file, shared_params, idx, total):
 
     start_time = time.time()
     try:
-        cmd = [sys.executable, TRAIN_SCRIPT, tmp_config, "--is-subprocess"]
+        use_ddp = batch_opts.get('use_ddp', False)
+        nproc_per_node = batch_opts.get('nproc_per_node', 'gpu')
+        # We assign a unique port per run to avoid port collision if running max_parallel > 1
+        base_port = batch_opts.get('master_port', 29500)
+        master_port = base_port + idx
+
+        if use_ddp:
+            cmd = [
+                sys.executable, "-m", "torch.distributed.run",
+                f"--nproc_per_node={nproc_per_node}",
+                f"--master_port={master_port}",
+                TRAIN_SCRIPT, tmp_config, "--is-subprocess"
+            ]
+        else:
+            cmd = [sys.executable, TRAIN_SCRIPT, tmp_config, "--is-subprocess"]
+            
         print(f"  [{idx}/{total}] Launching: {' '.join(cmd)}")
         
         proc = subprocess.run(
@@ -141,13 +161,13 @@ def main():
     try:
         if max_parallel <= 1:
             for idx, cfg_file in enumerate(config_files, 1):
-                result = run_one(cfg_file, shared_params, idx, total)
+                result = run_one(cfg_file, shared_params, batch_opts, idx, total)
                 results.append(result)
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
                 futures = {}
                 for idx, cfg_file in enumerate(config_files, 1):
-                    future = executor.submit(run_one, cfg_file, shared_params, idx, total)
+                    future = executor.submit(run_one, cfg_file, shared_params, batch_opts, idx, total)
                     futures[future] = cfg_file
                 for future in concurrent.futures.as_completed(futures):
                     results.append(future.result())

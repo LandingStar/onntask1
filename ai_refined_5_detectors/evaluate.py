@@ -1,6 +1,7 @@
 
 import sys
 import os
+import json
 
 # 1. Numpy & Matplotlib first
 import numpy as np
@@ -19,42 +20,6 @@ import torchvision.transforms.v2 as v2
 
 # 4. Local imports
 from train import DNN, cpu_transform
-import json
-import os
-
-config_path = os.path.join(os.path.dirname(__file__), 'config.json')
-with open(config_path) as f:
-    config = json.load(f)
-
-# Detectors
-detector_pos_init_config = config.get('detector_pos', None)
-detector_pos_xy = []
-
-if detector_pos_init_config is not None:
-    for x, y in detector_pos_init_config:
-        detector_pos_xy.append((x, y))
-else:
-    detector_pos_init = [
-        (803, 843, 273, 313),
-        (941, 981, 463, 503),
-        (941, 981, 697, 737),
-        (580, 620, 960, 1000),
-        (219, 259, 697, 737),
-    ]
-    for x0, x1, y0, y1 in detector_pos_init:
-        detector_pos_xy.append(((x0+x1)/2, (y0+y1)/2))
-
-import json
-
-# Load Config
-config_path = os.path.join(os.path.dirname(__file__), 'config.json')
-config = {}
-if os.path.exists(config_path):
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    print(f"Loaded config from {config_path}")
-else:
-    print(f"Config not found at {config_path}, using defaults")
 
 def evaluate():
     # 1. Find the latest result directory first
@@ -75,42 +40,16 @@ def evaluate():
         
     latest_subdir = None
     if os.path.exists(results_dir):
-        import re
-        from datetime import datetime
-        
-        # Regex to match default naming format: name_YYYYMMDD_HHMM
-        name_pattern = re.compile(r'^.+_(\d{8}_\d{4})$')
-        
-        valid_subdirs = []
-        for d in os.listdir(results_dir):
-            dir_path = os.path.join(results_dir, d)
-            if not os.path.isdir(dir_path):
-                continue
-                
-            # Determine effective path
-            target_path = None
-            target_name = d
-            
-            if os.path.exists(os.path.join(dir_path, "best_model.pth")):
-                target_path = dir_path
-            elif os.path.isdir(os.path.join(dir_path, d)) and os.path.exists(os.path.join(dir_path, d, "best_model.pth")):
-                target_path = os.path.join(dir_path, d)
-                
-            if target_path:
-                match = name_pattern.match(target_name)
-                if match:
-                    try:
-                        timestamp = datetime.strptime(match.group(1), "%Y%m%d_%H%M")
-                        valid_subdirs.append({'path': target_path, 'time': timestamp})
-                    except ValueError:
-                        pass
-                
-        if valid_subdirs:
-            latest_item = max(valid_subdirs, key=lambda x: x['time'])
-            latest_subdir = latest_item['path']
+        import glob
+        # We look for all subdirectories containing best_model.pth
+        model_paths = glob.glob(os.path.join(results_dir, "**", "best_model.pth"), recursive=True)
+        if model_paths:
+            # Sort by modification time to find the latest
+            model_paths.sort(key=os.path.getmtime, reverse=True)
+            latest_subdir = os.path.dirname(model_paths[0])
             
     if not latest_subdir:
-        print(f"No valid result subdirectories (containing best_model.pth and matching date format) found in {results_dir}.")
+        print(f"No valid result subdirectories (containing best_model.pth) found in {results_dir}.")
         return
 
     print(f"Latest result directory found: {latest_subdir}")
@@ -325,11 +264,18 @@ def evaluate():
         
     images_to_process = torch.stack(plot_images).to(device).float()
     
-    if images_to_process.shape[1] == 1:
-        images_squeezed = images_to_process.squeeze(1)
+    from train import gpu_transform_val
+    images_aug = gpu_transform_val(images_to_process)
+    
+    if images_aug.shape[1] == 1:
+        images_squeezed = images_aug.squeeze(1)
     else:
-        images_squeezed = images_to_process
-    images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
+        images_squeezed = images_aug
+        
+    if images_squeezed.shape[-1] == PhaseMask[0]:
+        images_input = images_squeezed
+    else:
+        images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
     
     with torch.no_grad():
         out_label, out_img, _ = model(images_input)
@@ -447,11 +393,18 @@ def evaluate():
     with torch.no_grad():
         for images, labels in val_dataloader:
             images = images.to(device).float()
-            if images.shape[1] == 1:
-                images_squeezed = images.squeeze(1)
+            
+            images_aug = gpu_transform_val(images)
+            
+            if images_aug.shape[1] == 1:
+                images_squeezed = images_aug.squeeze(1)
             else:
-                images_squeezed = images
-            images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
+                images_squeezed = images_aug
+                
+            if images_squeezed.shape[-1] == PhaseMask[0]:
+                images_input = images_squeezed
+            else:
+                images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
             
             out_label, _, _ = model(images_input)
             _, preds = torch.max(out_label, 1)

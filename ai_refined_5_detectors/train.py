@@ -1,4 +1,10 @@
 
+import os
+# Force thread limits BEFORE importing numpy or matplotlib to prevent RLIMIT_NPROC explosion
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -6,6 +12,9 @@ import matplotlib.pyplot as plt
 import itertools
 import copy
 import math
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import os
 import time
 import torch
@@ -31,9 +40,11 @@ config_path = os.path.join(BASE_DIR, 'config.json')
 # Check if a custom config path was passed as an argument
 is_custom_config = False
 is_subprocess = False
+is_imported = __name__ != "__main__"
 
 # Parse command line arguments
-print(f"\n[INIT] train.py launched with args: {sys.argv}")
+if not is_imported:
+    print(f"\n[INIT] train.py launched with args: {sys.argv}")
 
 for arg in sys.argv[1:]:
     if arg == "--is-subprocess":
@@ -46,19 +57,23 @@ for arg in sys.argv[1:]:
             config_path = os.path.join(BASE_DIR, custom_config)
         is_custom_config = True
 
-print(f"[INIT] is_subprocess: {is_subprocess}, is_custom_config: {is_custom_config}")
+if not is_imported:
+    print(f"[INIT] is_subprocess: {is_subprocess}, is_custom_config: {is_custom_config}")
 
 config = {}
 if os.path.exists(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
-    print(f"[INIT] Loaded config from {config_path}")
+    if not is_imported:
+        print(f"[INIT] Loaded config from {config_path}")
 else:
-    print(f"[INIT] Config not found at {config_path}, using defaults")
+    if not is_imported:
+        print(f"[INIT] Config not found at {config_path}, using defaults")
 
 # Intercept for batch training if configured
-# BUT ONLY IF we are reading the default config.json AND we are not a subprocess.
-if config.get('batch_train', False) and not is_subprocess:
+# BUT ONLY IF we are reading the default config.json AND we are not a subprocess AND not imported.
+# Also ensure batch_train doesn't trigger if launched via torchrun (LOCAL_RANK exists)
+if config.get('batch_train', False) and not is_subprocess and "LOCAL_RANK" not in os.environ and not is_imported:
     print(f"\n[INFO] 'batch_train' flag is true in config.json. Redirecting to batch_train.py...")
     import subprocess
     try:
@@ -70,9 +85,21 @@ if config.get('batch_train', False) and not is_subprocess:
         sys.exit(1)
     # The script should always exit here because batch_train handles all the runs
 
-# Constants and Configuration
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print('Using Device: ', device)
+# DDP Initialization
+is_ddp = "LOCAL_RANK" in os.environ and not is_imported
+if is_ddp:
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f'cuda:{local_rank}')
+    torch.cuda.set_device(device)
+    world_size = dist.get_world_size()
+    if local_rank == 0:
+        print(f'Using DDP with {world_size} GPUs. Current Device: {device}')
+else:
+    local_rank = 0
+    world_size = 1
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Using Device: ', device)
 
 BATCH_SIZE = config.get('batch_size', 48)
 
@@ -445,6 +472,8 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
           minus_mask_ratio=0, label_num=20, exp_name="default"):
     
     currentDate = time.strftime("%Y%m%d_%H%M", time.localtime())
+    is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+    model_to_save = model.module if isinstance(model, DDP) else model
     
     # Save Dir Logic
     results_dir = config.get('results_dir', 'results')
@@ -453,23 +482,26 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         results_dir = os.path.join(BASE_DIR, results_dir)
         
     save_dir = os.path.join(results_dir, f"{exp_name}_{currentDate}")
-    os.makedirs(save_dir, exist_ok=True)
+    
+    if is_main_process:
+        os.makedirs(save_dir, exist_ok=True)
 
-    # Save Config
-    with open(os.path.join(save_dir, 'config.json'), 'w') as f:
-        # Don't save batch_train=False if it was originally true, but it's safe to just dump current
-        json.dump(config, f, indent=4)
-        
-    # Setup CSV logger for metrics
-    metrics_csv_path = os.path.join(save_dir, 'metrics.csv')
-    with open(metrics_csv_path, 'w') as f:
-        f.write("epoch,train_loss,val_loss,train_acc,val_acc,learning_rate\n")
+        # Save Config
+        with open(os.path.join(save_dir, 'config.json'), 'w') as f:
+            # Don't save batch_train=False if it was originally true, but it's safe to just dump current
+            json.dump(config, f, indent=4)
+            
+        # Setup CSV logger for metrics
+        metrics_csv_path = os.path.join(save_dir, 'metrics.csv')
+        with open(metrics_csv_path, 'w') as f:
+            f.write("epoch,train_loss,val_loss,train_acc,val_acc,learning_rate\n")
     
     train_loss_hist = []
     test_loss_hist = []
     train_acc_hist = []
     test_acc_hist = []
-    best_acc = 0
+    best_score = -float('inf')
+    best_acc_for_log = 0.0
     
     # Dynamic Spatial Mask Loss Weight parameters
     spatial_mask_weight = float(config.get('spatial_mask_loss_weight', 0.05))
@@ -478,12 +510,14 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     acc_threshold = config.get('auto_spatial_mask_acc_threshold', 0.90)
     weight_step = config.get('auto_spatial_mask_weight_step', 1.1)
     
+    current_cooldown = 0
+    cooldown_epochs = config.get('auto_spatial_mask_cooldown', 3)
+    
     if label_num >= 2 * num_classes:
         # num_classes += 1 # Disable for 5-detector specific task
         pass
     classes_num = num_classes
     
-    # Inherit last best model logic
     if config.get('inherit_best_model', False):
         import glob
         model_paths = glob.glob(os.path.join(results_dir, "*", "best_model.pth"))
@@ -491,29 +525,37 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             # Sort by modification time, newest first
             model_paths.sort(key=os.path.getmtime, reverse=True)
             last_best_model_path = model_paths[0]
-            print(f"Inheriting last best model from: {last_best_model_path}")
+            if is_main_process:
+                print(f"Inheriting last best model from: {last_best_model_path}")
             try:
-                model.load_state_dict(torch.load(last_best_model_path))
-                print("Successfully loaded last best model.")
+                # Need map_location to load onto correct device
+                model_to_save.load_state_dict(torch.load(last_best_model_path, map_location=device))
+                if is_main_process:
+                    print("Successfully loaded last best model.")
             except Exception as e:
-                print(f"Failed to load last best model: {e}")
+                if is_main_process:
+                    print(f"Failed to load last best model: {e}")
         else:
-            print("No previous best_model.pth found to inherit.")
-            
+            if is_main_process:
+                print("No previous best_model.pth found to inherit.")
+                
     if os.path.exists(f"{save_dir}/best_model.pth"):
-        print("Loading existing checkpoint from current save_dir...")
-        model.load_state_dict(torch.load(f"{save_dir}/best_model.pth"))
+        if is_main_process:
+            print("Loading existing checkpoint from current save_dir...")
+        model_to_save.load_state_dict(torch.load(f"{save_dir}/best_model.pth", map_location=device))
         
-    print(f"Training started. Classes: {classes_num}, Labels: {label_num}")
+    if is_main_process:
+        print(f"Training started. Classes: {classes_num}, Labels: {label_num}")
     
     # Setup training log file
     log_file_path = os.path.join(save_dir, "training_log.txt")
-    with open(log_file_path, "w") as f:
-        f.write(f"Experiment: {exp_name}\n")
-        f.write(f"Date: {currentDate}\n")
-        f.write("="*50 + "\n")
-        f.write("Epoch | Train Loss | Train Acc | Val Loss | Val Acc | LR | Int.Ratio | MaskWt | Time(s) | Status\n")
-        f.write("-" * 80 + "\n")
+    if is_main_process:
+        with open(log_file_path, "w") as f:
+            f.write(f"Experiment: {exp_name}\n")
+            f.write(f"Date: {currentDate}\n")
+            f.write("="*50 + "\n")
+            f.write("Epoch | Train Loss | Train Acc | Val Loss | Val Acc | LR | Int.Ratio | MaskWt | Time(s) | Status\n")
+            f.write("-" * 80 + "\n")
         
     start_time = time.time()
 
@@ -530,12 +572,15 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         # Calculate sigma based on target encircled energy
         # For a 2D Gaussian, Integral over [-L/2, L/2] is erf(L / (2*sqrt(2)*sigma))^2
         target_energy = config.get('target_encircled_energy', 0.8)
-        import scipy.special as sp
+        
         # Protect against edge cases
         target_energy = max(1e-4, min(0.9999, target_energy))
-        target_erf = np.sqrt(target_energy)
-        val = sp.erfinv(target_erf)
-        sigma = det_size / (2 * np.sqrt(2) * val)
+        target_erf = math.sqrt(target_energy)
+        
+        # Use PyTorch's built-in erfinv to avoid scipy dependency
+        val = torch.erfinv(torch.tensor([target_erf])).item()
+        
+        sigma = det_size / (2 * math.sqrt(2) * val)
         
         for ind, pos in enumerate(model.detector_pos):
             x, y = pos
@@ -610,10 +655,17 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             # Actually, let's keep a small image loss just to guide spatial locality, but rely on vec loss.
             
             loss = loss_function(sample_img, target_mask)
+            # Normalization of loss to make spatial_mask_weight more impactful
+            # F.mse_loss on vector is usually very small (e.g., 0.1), while loss_function (sum of squared errors over 1200x1200) is large
+            # We scale vector loss so they are more comparable, or we ensure spatial weight acts on the large loss.
+            # Currently spatial_mask_weight is applied to `loss` (pixel-wise MSE), but `loss` can be huge.
+            # Let's keep it as is, but ensure spatial_mask_weight is large enough.
             loss_vec = F.mse_loss(output_vec[i], target_mask_weight)
             det_weights = config.get('detector_loss_weight', None)
             w = det_weights[base_det] if det_weights else 1.0
-            # Use dynamic spatial_mask_weight instead of hardcoded 0.05
+            
+            # The original logic: spatial_mask_weight scales the pixel-wise loss.
+            # If auto_spatial_weight_on increases this weight, the model is forced to match the Gaussian mask tighter.
             batch_loss += w * (spatial_mask_weight * loss + 1.0 * loss_vec)
 
         return batch_loss
@@ -708,8 +760,15 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             
             pbar.set_postfix({'loss': loss.item()/labels.size(0), 'acc': batch_correct/labels.size(0)})
         
-        avg_train_loss = ep_train_loss / len(trainloader.dataset)
-        train_acc = correct / total
+        if dist.is_initialized():
+            train_metrics = torch.tensor([ep_train_loss, correct, total], dtype=torch.float64, device=device)
+            dist.all_reduce(train_metrics, op=dist.ReduceOp.SUM)
+            ep_train_loss = train_metrics[0].item()
+            correct = train_metrics[1].item()
+            total = train_metrics[2].item()
+
+        avg_train_loss = ep_train_loss / total if total > 0 else 0
+        train_acc = correct / total if total > 0 else 0
         train_loss_hist.append(avg_train_loss)
         train_acc_hist.append(train_acc)
         
@@ -772,9 +831,21 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 target_avg_intensity_ratio = target_intensities * area_ratio
                 val_target_intensity_sum += target_avg_intensity_ratio.sum().item()
 
-        avg_test_loss = ep_test_loss / len(testloader.dataset)
-        test_acc = correct / total
-        avg_target_intensity_ratio = val_target_intensity_sum / total
+        if dist.is_initialized():
+            val_metrics = torch.tensor([ep_test_loss, correct, total, val_target_intensity_sum], dtype=torch.float64, device=device)
+            dist.all_reduce(val_metrics, op=dist.ReduceOp.SUM)
+            ep_test_loss = val_metrics[0].item()
+            correct = val_metrics[1].item()
+            total = val_metrics[2].item()
+            val_target_intensity_sum = val_metrics[3].item()
+
+        avg_test_loss = ep_test_loss / total if total > 0 else 0
+        test_acc = correct / total if total > 0 else 0
+        
+        # Calculate dataset-wide average intensity ratio
+        # Instead of averaging the batch averages, we calculate the total sum of intensities 
+        # divided by total samples to get the true dataset-wide average.
+        avg_target_intensity_ratio = val_target_intensity_sum / total if total > 0 else 0
         
         test_loss_hist.append(avg_test_loss)
         test_acc_hist.append(test_acc)
@@ -788,68 +859,115 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         else:
             scheduler.step()
             
-        print(f"Epoch {epoch+1} Results:")
-        print(f"Train Loss: {avg_train_loss:.6f} | Train Acc: {train_acc:.6f}")
-        print(f"Val Loss: {avg_test_loss:.6f} | Val Acc: {test_acc:.6f}")
-        print(f"Avg Target Intensity Ratio: {avg_target_intensity_ratio:.4f}")
+        if is_main_process:
+            print(f"Epoch {epoch+1} Results:")
+            print(f"Train Loss: {avg_train_loss:.6f} | Train Acc: {train_acc:.6f}")
+            print(f"Val Loss: {avg_test_loss:.6f} | Val Acc: {test_acc:.6f}")
+            print(f"Avg Target Intensity Ratio: {avg_target_intensity_ratio:.4f}")
         
         # Dynamic Spatial Mask Loss Weight Adjustment
         if auto_spatial_weight_on:
-            if test_acc >= acc_threshold and avg_target_intensity_ratio < target_ratio:
-                spatial_mask_weight *= weight_step
-                print(f"[*] Acc >= {acc_threshold} but Intensity {avg_target_intensity_ratio:.4f} < {target_ratio}.")
-                print(f"[*] Increasing spatial_mask_loss_weight to: {spatial_mask_weight:.4f}")
-            elif test_acc < (acc_threshold - 0.1):
-                # If accuracy drops significantly, reduce the spatial constraint to let the model recover
-                old_weight = spatial_mask_weight
-                spatial_mask_weight = max(0.001, spatial_mask_weight * 0.9)
-                if old_weight != spatial_mask_weight:
-                    print(f"[*] Acc dropped below {acc_threshold - 0.1:.2f}.")
-                    print(f"[*] Decreasing spatial_mask_loss_weight to: {spatial_mask_weight:.4f}")
+            if current_cooldown > 0:
+                current_cooldown -= 1
+            else:
+                # Use a moving average or direct evaluation to decide on step
+                # Because spatial_mask_weight scales the huge pixel-wise MSE, increasing it forces the network
+                # to concentrate energy at the expense of classification loss.
+                if test_acc >= acc_threshold and avg_target_intensity_ratio < target_ratio:
+                    spatial_mask_weight *= weight_step
+                    if is_main_process:
+                        print(f"[*] Acc ({test_acc:.4f}) >= {acc_threshold} but Intensity ({avg_target_intensity_ratio:.4f}) < {target_ratio}.")
+                        print(f"[*] Increasing spatial_mask_loss_weight to: {spatial_mask_weight:.6f}")
+                    # Reset scheduler patience to avoid punishing the model for landscape changes
+                    if hasattr(scheduler, '_reset'):
+                        scheduler._reset()
+                        if is_main_process:
+                            print("[*] Resetting lr_scheduler patience to adapt to new loss landscape.")
+                    current_cooldown = cooldown_epochs
+                elif test_acc < (acc_threshold - 0.05):
+                    # If accuracy drops significantly, reduce the spatial constraint to let the model recover
+                    old_weight = spatial_mask_weight
+                    # Only decrease if we are significantly above 0
+                    if spatial_mask_weight > 0.0001:
+                        # Slightly larger drop to recover accuracy faster
+                        spatial_mask_weight = max(0.0001, spatial_mask_weight * 0.8)
+                        if old_weight != spatial_mask_weight:
+                            if is_main_process:
+                                print(f"[*] Acc ({test_acc:.4f}) dropped below {acc_threshold - 0.05:.2f}.")
+                                print(f"[*] Decreasing spatial_mask_loss_weight to: {spatial_mask_weight:.6f}")
+                            # Reset scheduler patience
+                            if hasattr(scheduler, '_reset'):
+                                scheduler._reset()
+                                if is_main_process:
+                                    print("[*] Resetting lr_scheduler patience to adapt to new loss landscape.")
+                            current_cooldown = cooldown_epochs
         
+        # Evaluate if this is the best model
         status_msg = ""
-        if test_acc > best_acc:
-            best_acc = test_acc
-            # Note: Saving a model can take a few seconds depending on I/O speed.
-            torch.save(model.state_dict(), f"{save_dir}/best_model.pth")
-            print(f"Saved best model with acc: {best_acc:.6f}")
+        # The score metric balances accuracy and spatial concentration
+        # Default: just use test_acc
+        current_score = test_acc
+        
+        # If dynamic weight is on, use a composite score: acc * (intensity_ratio ^ alpha)
+        # We need accuracy to remain high while encouraging high intensity.
+        # Alternatively, score = test_acc if test_acc < acc_threshold else test_acc + avg_target_intensity_ratio
+        if auto_spatial_weight_on:
+            # We value both. Give higher score for reaching intensity goals while maintaining acc.
+            # Example: 0.90 acc + 0.15 ratio = 1.05. 0.88 acc + 0.20 ratio = 1.08. 
+            # We weight acc more heavily to ensure it doesn't plummet just for energy.
+            acc_importance = config.get('best_model_acc_weight', 1.0)
+            int_importance = config.get('best_model_intensity_weight', 0.5)
+            current_score = (test_acc * acc_importance) + (avg_target_intensity_ratio * int_importance)
+
+        if current_score > best_score:
+            best_score = current_score
+            best_acc_for_log = test_acc
+            if is_main_process:
+                torch.save(model_to_save.state_dict(), f"{save_dir}/best_model.pth")
+                print(f"Saved best model with acc: {test_acc:.6f}, intensity: {avg_target_intensity_ratio:.4f}, score: {best_score:.4f}")
             status_msg = "Best Model Saved"
             
         epoch_time = time.time() - epoch_start_time
         current_lr = optimizer.param_groups[0]['lr']
         
-        # Log metrics to CSV
-        with open(metrics_csv_path, 'a') as f:
-            f.write(f"{epoch + 1},{avg_train_loss:.6f},{avg_test_loss:.6f},{train_acc:.6f},{test_acc:.6f},{current_lr:.2e}\n")
-        
-        # Write to log file
-        with open(log_file_path, "a") as f:
-            f.write(f"{epoch+1:5d} | {avg_train_loss:10.6f} | {train_acc:9.4f} | {avg_test_loss:8.6f} | {test_acc:7.4f} | {current_lr:.2e} | {avg_target_intensity_ratio:7.4f} | {spatial_mask_weight:7.4f} | {epoch_time:7.2f} | {status_msg}\n")
-        
-        # Plotting - move to a background thread to prevent blocking the next epoch
-        import threading
-        plot_thread = threading.Thread(
-            target=plot_loss_acc, 
-            args=(list(train_loss_hist), list(test_loss_hist), list(train_acc_hist), list(test_acc_hist), f"{save_dir}/loss_acc.png")
-        )
-        plot_thread.start()
-        
-        # Save Outputs (if configured)
-        if config.get("save_csv_logs", False):
-            # Only save CSV logs at the last epoch or if explicitly needed frequently, as np.savetxt is extremely slow
-            if epoch == epochs - 1 or config.get("save_csv_logs_every_epoch", False):
-                csv_log_dir = f"{save_dir}/csv_logs"
-                os.makedirs(csv_log_dir, exist_ok=True)
-                np.savetxt(f"{csv_log_dir}/mask_epoch_{epoch+1}.csv", model.phase_mask[0].detach().cpu().numpy(), delimiter=",")
-                np.savetxt(f"{csv_log_dir}/detector_pos_epoch_{epoch+1}.csv", model.detector_pos.detach().cpu().numpy(), delimiter=",")
+        if is_main_process:
+            # Log metrics to CSV
+            with open(metrics_csv_path, 'a') as f:
+                f.write(f"{epoch + 1},{avg_train_loss:.6f},{avg_test_loss:.6f},{train_acc:.6f},{test_acc:.6f},{current_lr:.2e}\n")
+            
+            # Write to log file
+            with open(log_file_path, "a") as f:
+                f.write(f"{epoch+1:5d} | {avg_train_loss:10.6f} | {train_acc:9.4f} | {avg_test_loss:8.6f} | {test_acc:7.4f} | {current_lr:.2e} | {avg_target_intensity_ratio:7.4f} | {spatial_mask_weight:7.4f} | {epoch_time:7.2f} | {status_msg}\n")
+            
+            # Plotting - move to a background thread to prevent blocking the next epoch
+            import threading
+            plot_thread = threading.Thread(
+                target=plot_loss_acc, 
+                args=(list(train_loss_hist), list(test_loss_hist), list(train_acc_hist), list(test_acc_hist), f"{save_dir}/loss_acc.png")
+            )
+            plot_thread.start()
+            
+            # Save Outputs (if configured)
+            if config.get("save_csv_logs", False):
+                # Only save CSV logs at the last epoch or if explicitly needed frequently, as np.savetxt is extremely slow
+                if epoch == epochs - 1 or config.get("save_csv_logs_every_epoch", False):
+                    csv_log_dir = f"{save_dir}/csv_logs"
+                    os.makedirs(csv_log_dir, exist_ok=True)
+                    np.savetxt(f"{csv_log_dir}/mask_epoch_{epoch+1}.csv", model_to_save.phase_mask[0].detach().cpu().numpy(), delimiter=",")
+                    np.savetxt(f"{csv_log_dir}/detector_pos_epoch_{epoch+1}.csv", model_to_save.detector_pos.detach().cpu().numpy(), delimiter=",")
 
     elapsed_time = time.time() - start_time
-    print(f"Total time for {epochs} epochs: {elapsed_time:.2f} seconds")
-    
-    with open(log_file_path, "a") as f:
-        f.write("-" * 80 + "\n")
-        f.write(f"Total training time: {elapsed_time:.2f} seconds\n")
-        f.write(f"Best Validation Accuracy: {best_acc:.6f}\n")
+    if is_main_process:
+        print(f"Total time for {epochs} epochs: {elapsed_time:.2f} seconds")
+        
+        with open(log_file_path, "a") as f:
+            f.write("-" * 80 + "\n")
+            f.write(f"Total training time: {elapsed_time:.2f} seconds\n")
+            if auto_spatial_weight_on:
+                f.write(f"Best Validation Accuracy (associated with best score): {best_acc_for_log:.6f}\n")
+                f.write(f"Best Score: {best_score:.6f}\n")
+            else:
+                f.write(f"Best Validation Accuracy: {best_score:.6f}\n")
         
     return elapsed_time
 
@@ -883,10 +1001,15 @@ if __name__ == "__main__":
         train_prefetch = config.get('prefetch_factor', 2) if train_num_workers > 0 else None
         val_prefetch = config.get('prefetch_factor', 2) if val_num_workers > 0 else None
         
+        # DDP Samplers
+        train_sampler = DistributedSampler(train_dataset) if is_ddp else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_ddp else None
+        
         train_dataloader = DataLoader(
             train_dataset, 
             batch_size=BATCH_SIZE, 
-            shuffle=True, 
+            shuffle=(train_sampler is None), # Shuffle must be False if using Sampler
+            sampler=train_sampler,
             num_workers=train_num_workers, 
             pin_memory=True,
             prefetch_factor=train_prefetch,
@@ -897,6 +1020,7 @@ if __name__ == "__main__":
             val_dataset, 
             batch_size=BATCH_SIZE, 
             shuffle=False, 
+            sampler=val_sampler,
             num_workers=val_num_workers, 
             pin_memory=True,
             prefetch_factor=val_prefetch,
@@ -906,11 +1030,19 @@ if __name__ == "__main__":
         
         # Experiment from Config
         exp_name = config.get('exp_name', 'default_run_5det')
-        print(f"\n--- Running Experiment: {exp_name} ---")
+        if local_rank == 0:
+            print(f"\n--- Running Experiment: {exp_name} ---")
         
         # Model (Defaults from global config)
         model = DNN()
         model = model.to(device)
+        
+        if is_ddp:
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+            # When using DDP, model parameters are accessed via model.module
+            model_to_save = model.module
+        else:
+            model_to_save = model
         
         # Use MSELoss as in ai_refined
         criterion = torch.nn.MSELoss(reduction='sum')
@@ -937,143 +1069,149 @@ if __name__ == "__main__":
                        label_num=label_num,
                        exp_name=exp_name)
         
-        print(f"Time taken (1 epoch): {time_1:.2f}s")
+        if local_rank == 0:
+            print(f"Time taken (1 epoch): {time_1:.2f}s")
 
-        # Use the global save_dir initialized in train function.
-        # We need to construct it here since we are in __main__ and time_1 only returns elapsed time.
-        # The best way is to fetch the latest created folder that matches exp_name
-        results_dir_final = config.get('results_dir', 'results')
-        if not os.path.isabs(results_dir_final):
-            results_dir_final = os.path.join(BASE_DIR, results_dir_final)
+            # Use the global save_dir initialized in train function.
+            # We need to construct it here since we are in __main__ and time_1 only returns elapsed time.
+            # The best way is to fetch the latest created folder that matches exp_name
+            results_dir_final = config.get('results_dir', 'results')
+            if not os.path.isabs(results_dir_final):
+                results_dir_final = os.path.join(BASE_DIR, results_dir_final)
+                
+            import glob
+            # Find the specific experiment directory just created
+            possible_dirs = glob.glob(os.path.join(results_dir_final, f"{exp_name}_*"))
+            if possible_dirs:
+                possible_dirs.sort(key=os.path.getmtime, reverse=True)
+                target_save_dir = possible_dirs[0]
+            else:
+                # Fallback to results_dir root if we can't find the specific one
+                target_save_dir = results_dir_final
+                
+            debug_log_path = os.path.join(target_save_dir, 'debug.log')
             
-        import glob
-        # Find the specific experiment directory just created
-        possible_dirs = glob.glob(os.path.join(results_dir_final, f"{exp_name}_*"))
-        if possible_dirs:
-            possible_dirs.sort(key=os.path.getmtime, reverse=True)
-            target_save_dir = possible_dirs[0]
-        else:
-            # Fallback to results_dir root if we can't find the specific one
-            target_save_dir = results_dir_final
-            
-        debug_log_path = os.path.join(target_save_dir, 'debug.log')
-        
-        # Setup global debug.log redirection if not in a terminal
-        # This will capture ALL print statements from this point forward (including subprocess outputs if printed)
-        class LoggerWriter:
-            def __init__(self, filename, stream):
-                self.filename = filename
-                self.stream = stream
-            def write(self, message):
-                self.stream.write(message)
-                self.stream.flush()
-                with open(self.filename, 'a', encoding='utf-8') as log_file:
-                    log_file.write(message)
-            def flush(self):
-                self.stream.flush()
+            # Setup global debug.log redirection if not in a terminal
+            # This will capture ALL print statements from this point forward (including subprocess outputs if printed)
+            class LoggerWriter:
+                def __init__(self, filename, stream):
+                    self.filename = filename
+                    self.stream = stream
+                def write(self, message):
+                    self.stream.write(message)
+                    self.stream.flush()
+                    with open(self.filename, 'a', encoding='utf-8') as log_file:
+                        log_file.write(message)
+                def flush(self):
+                    self.stream.flush()
 
-        original_stdout = sys.stdout
-        original_stderr = sys.stderr
-        sys.stdout = LoggerWriter(debug_log_path, sys.stdout)
-        sys.stderr = LoggerWriter(debug_log_path, sys.stderr)
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+            sys.stdout = LoggerWriter(debug_log_path, sys.stdout)
+            sys.stderr = LoggerWriter(debug_log_path, sys.stderr)
 
-        # Run Evaluation if configured
-        if config.get("run_evaluate_after_train", True):
-            print("\n--- Running Evaluation ---")
-            # Run as a subprocess to avoid context/memory issues and ensure it works cross-platform
-            import subprocess
-            
-            # Determine capture mode based on debug flag
-            debug_eval = config.get("debug_eval_subprocess", False)
-            
+            # Run Evaluation if configured
+            if config.get("run_evaluate_after_train", True):
+                print("\n--- Running Evaluation ---")
+                # Run as a subprocess to avoid context/memory issues and ensure it works cross-platform
+                import subprocess
+                
+                # Determine capture mode based on debug flag
+                debug_eval = config.get("debug_eval_subprocess", False)
+                
+                try:
+                    if debug_eval:
+                        log_msg = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluate.py...\n"
+                        # Print to terminal, which will be caught by LoggerWriter and written to debug.log
+                        print(log_msg.strip())
+                        
+                        result = subprocess.run(
+                            [sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], 
+                            check=False,
+                            capture_output=True,
+                            text=True
+                        )
+                        
+                        # Print captured output so LoggerWriter can write it to debug.log
+                        print(f"Return code: {result.returncode}")
+                        print(f"STDOUT:\n{result.stdout}")
+                        print(f"STDERR:\n{result.stderr}")
+                        print("-" * 50)
+                            
+                        if result.returncode != 0:
+                            print(f"Evaluation script failed with code {result.returncode}. See {debug_log_path} for details.")
+                    else:
+                        # Silent mode: redirect subprocess output directly to debug.log
+                        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluate.py (silent mode)...")
+                        with open(debug_log_path, 'a', encoding='utf-8') as f_log:
+                            try:
+                                result = subprocess.run(
+                                    [sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], 
+                                    check=True,
+                                    stdout=f_log,
+                                    stderr=subprocess.STDOUT
+                                )
+                                print("Evaluation completed successfully.")
+                            except subprocess.CalledProcessError as e:
+                                print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Evaluation failed with code {e.returncode}")
+                                raise e
+                except subprocess.CalledProcessError as e:
+                    print(f"Evaluation script failed: {e}")
+                except Exception as e:
+                    print(f"Evaluation script failed to start: {e}")
+                
+            # Archive Results
+            print("\n--- Archiving Results ---")
             try:
+                import subprocess
+                
+                debug_eval = config.get("debug_eval_subprocess", False)
                 if debug_eval:
-                    log_msg = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluate.py...\n"
-                    # Print to terminal, which will be caught by LoggerWriter and written to debug.log
+                    log_msg = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running archive_results.py...\n"
                     print(log_msg.strip())
                     
                     result = subprocess.run(
-                        [sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], 
+                        [sys.executable, os.path.join(BASE_DIR, 'archive_results.py')], 
                         check=False,
                         capture_output=True,
                         text=True
                     )
                     
-                    # Print captured output so LoggerWriter can write it to debug.log
                     print(f"Return code: {result.returncode}")
                     print(f"STDOUT:\n{result.stdout}")
                     print(f"STDERR:\n{result.stderr}")
                     print("-" * 50)
                         
                     if result.returncode != 0:
-                        print(f"Evaluation script failed with code {result.returncode}. See {debug_log_path} for details.")
+                        print(f"Archiving script failed with code {result.returncode}. See {debug_log_path} for details.")
+                            
                 else:
-                    # Silent mode: redirect subprocess output directly to debug.log
-                    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluate.py (silent mode)...")
+                    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running archive_results.py (silent mode)...")
                     with open(debug_log_path, 'a', encoding='utf-8') as f_log:
                         try:
                             result = subprocess.run(
-                                [sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], 
+                                [sys.executable, os.path.join(BASE_DIR, 'archive_results.py')], 
                                 check=True,
                                 stdout=f_log,
                                 stderr=subprocess.STDOUT
                             )
-                            print("Evaluation completed successfully.")
+                            print("Archiving completed successfully.")
                         except subprocess.CalledProcessError as e:
-                            print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Evaluation failed with code {e.returncode}")
+                            print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Archiving failed with code {e.returncode}")
                             raise e
-            except subprocess.CalledProcessError as e:
-                print(f"Evaluation script failed: {e}")
             except Exception as e:
-                print(f"Evaluation script failed to start: {e}")
-            
-        # Archive Results
-        print("\n--- Archiving Results ---")
-        try:
-            import subprocess
-            
-            debug_eval = config.get("debug_eval_subprocess", False)
-            if debug_eval:
-                log_msg = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running archive_results.py...\n"
-                print(log_msg.strip())
+                print(f"Archiving script failed: {e}")
                 
-                result = subprocess.run(
-                    [sys.executable, os.path.join(BASE_DIR, 'archive_results.py')], 
-                    check=False,
-                    capture_output=True,
-                    text=True
-                )
-                
-                print(f"Return code: {result.returncode}")
-                print(f"STDOUT:\n{result.stdout}")
-                print(f"STDERR:\n{result.stderr}")
-                print("-" * 50)
-                    
-                if result.returncode != 0:
-                    print(f"Archiving script failed with code {result.returncode}. See {debug_log_path} for details.")
-                        
-            else:
-                print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running archive_results.py (silent mode)...")
-                with open(debug_log_path, 'a', encoding='utf-8') as f_log:
-                    try:
-                        result = subprocess.run(
-                            [sys.executable, os.path.join(BASE_DIR, 'archive_results.py')], 
-                            check=True,
-                            stdout=f_log,
-                            stderr=subprocess.STDOUT
-                        )
-                        print("Archiving completed successfully.")
-                    except subprocess.CalledProcessError as e:
-                        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Archiving failed with code {e.returncode}")
-                        raise e
-        except Exception as e:
-            print(f"Archiving script failed: {e}")
-            
-        # Restore original stdout/stderr
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
+            # Restore original stdout/stderr
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
         
+        if is_ddp:
+            dist.destroy_process_group()
+            
     except Exception as e:
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
+        if 'is_ddp' in locals() and is_ddp and dist.is_initialized():
+            dist.destroy_process_group()

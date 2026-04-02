@@ -8,5 +8,12 @@
     "debug_eval_subprocess": true,
     "transform_intensity": 0.2,
     "scheduler_patience": 10,
-    "scheduler_metric" : "acc"
+    "scheduler_metric" : "acc",
+    "target_encircled_energy": 0.8,
+    "spatial_mask_loss_weight": 0.05,
+    
+    "auto_spatial_mask_weight": true,
+    "auto_spatial_mask_target_ratio": 50.0,
+    "auto_spatial_mask_acc_threshold": 0.90,
+    "auto_spatial_mask_weight_step": 1.1
 }
