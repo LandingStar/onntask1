@@ -9,11 +9,13 @@
     "transform_intensity": 0.2,
     "scheduler_patience": 10,
     "scheduler_metric" : "acc",
-    "target_encircled_energy": 0.8,
-    "spatial_mask_loss_weight": 0.1,
+    "spatial_mask_loss_weight": 0.02,
     
-    "auto_spatial_mask_weight": true,
-    "auto_spatial_mask_target_ratio": 50.0,
-    "auto_spatial_mask_acc_threshold": 0.90,
-    "auto_spatial_mask_weight_step": 1.1
+    "auto_spatial_mask_target_ratio": 25.0,
+    "best_model_acc_weight": 1.0,
+    "best_model_intensity_weight": 0.5,
+
+    "use_ddp": false,
+    "nproc_per_node": "gpu",
+    "master_port": 29500
 }

@@ -505,14 +505,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     
     # Dynamic Spatial Mask Loss Weight parameters
     spatial_mask_weight = float(config.get('spatial_mask_loss_weight', 0.05))
-    auto_spatial_weight_on = config.get('auto_spatial_mask_weight', False)
     target_ratio = config.get('auto_spatial_mask_target_ratio', 0.1)
-    acc_threshold = config.get('auto_spatial_mask_acc_threshold', 0.90)
-    weight_step = config.get('auto_spatial_mask_weight_step', 1.1)
-    
-    current_cooldown = 0
-    cooldown_epochs = config.get('auto_spatial_mask_cooldown', 3)
-    has_stepped_up = False
     
     if label_num >= 2 * num_classes:
         # num_classes += 1 # Disable for 5-detector specific task
@@ -566,38 +559,16 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         
         batch_loss = torch.tensor(0.0, device=device)
         
-        current_labels_image_tensors = torch.zeros((classes_num, PhaseMask[0], PhaseMask[1]), device=device, dtype=torch.float32)
+        det_shape = config.get('detector_shape', 'circle')
+        det_size_config = config.get('detector_size', 60)
         
-        det_size = config.get('detector_size', 60)
-        
-        # Calculate sigma based on target encircled energy
-        # For a 2D Gaussian, Integral over [-L/2, L/2] is erf(L / (2*sqrt(2)*sigma))^2
-        target_energy = config.get('target_encircled_energy', 0.8)
-        
-        # Protect against edge cases
-        target_energy = max(1e-4, min(0.9999, target_energy))
-        target_erf = math.sqrt(target_energy)
-        
-        # Use PyTorch's built-in erfinv to avoid scipy dependency
-        val = torch.erfinv(torch.tensor([target_erf])).item()
-        
-        sigma = det_size / (2 * math.sqrt(2) * val)
-        
-        for ind, pos in enumerate(model.detector_pos):
-            x, y = pos
+        if det_shape == 'square':
+            det_area = det_size_config * det_size_config
+        else: # circle
+            det_area = np.pi * (det_size_config / 2)**2
             
-            # Generate Gaussian Mask
-            grid_x = torch.arange(0, PhaseMask[0], device=device).float()
-            grid_y = torch.arange(0, PhaseMask[1], device=device).float()
-            gx, gy = torch.meshgrid(grid_x, grid_y, indexing='ij')
-            
-            dist_sq = (gx - x)**2 + (gy - y)**2
-            gaussian = torch.exp(-dist_sq / (2 * sigma**2))
-            
-            if ind < classes_num:
-                current_labels_image_tensors[ind] = gaussian
-                if current_labels_image_tensors[ind].sum() > 0:
-                    current_labels_image_tensors[ind] /= current_labels_image_tensors[ind].sum()
+        global_area = PhaseMask[0] * PhaseMask[1]
+        area_ratio = global_area / det_area
 
         for i in range(images.size(0)):
             sample_label = labels[i].item()
@@ -638,36 +609,25 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 # Hard label mode: each label maps to exactly one detector
                 target_mask_weight[base_det] = 1.0
             
-            target_mask = torch.einsum('c,chw->hw', target_mask_weight, current_labels_image_tensors)
-            
-            # Optimization: 
-            # Pixel-wise MSE (loss) enforces uniform distribution within the detector, which is too strict and unnecessary.
-            # We only care about the total energy in the detector (loss_vec).
-            # We reduce the weight of pixel-wise loss or remove it.
-            # Here we keep it but with very small weight, or rely mainly on loss_vec.
-            
-            # loss = loss_function(sample_img, target_mask) # Original Pixel-wise MSE
-            
-            # New Strategy: Rely primarily on Vector Loss (loss_vec) which allows any distribution within the detector box.
-            # To prevent energy from scattering everywhere, we can add a regularization term minimizing energy OUTSIDE all detectors.
-            
-            # But for now, let's just trust loss_vec which we fixed.
-            # We will use a mixed approach: 0.0 * image_loss + 1.0 * vector_loss
-            # Actually, let's keep a small image loss just to guide spatial locality, but rely on vec loss.
-            
-            loss = loss_function(sample_img, target_mask)
-            # Normalization of loss to make spatial_mask_weight more impactful
-            # F.mse_loss on vector is usually very small (e.g., 0.1), while loss_function (sum of squared errors over 1200x1200) is large
-            # We scale vector loss so they are more comparable, or we ensure spatial weight acts on the large loss.
-            # Currently spatial_mask_weight is applied to `loss` (pixel-wise MSE), but `loss` can be huge.
-            # Let's keep it as is, but ensure spatial_mask_weight is large enough.
+            # 1. Vector Loss (Classification / Distribution matching)
+            # This ensures the correct detectors get the majority of the energy sum
             loss_vec = F.mse_loss(output_vec[i], target_mask_weight)
+            
+            # 2. Target Energy Penalty (Spatial Concentration)
+            # output_vec[i] contains the sum ratios for all detectors.
+            # target_mask_weight defines the ideal ratios.
+            # We want the average intensity ratio inside the target detector(s) to reach `target_ratio`.
+            # Intensity Ratio = Sum Ratio * (Global_Area / Det_Area)
+            current_target_intensity_ratio = (output_vec[i] * target_mask_weight).sum() * area_ratio
+            
+            # Only penalize if it's below the target_ratio
+            loss_energy = F.relu(target_ratio - current_target_intensity_ratio)
+            
             det_weights = config.get('detector_loss_weight', None)
             w = det_weights[base_det] if det_weights else 1.0
             
-            # The original logic: spatial_mask_weight scales the pixel-wise loss.
-            # If auto_spatial_weight_on increases this weight, the model is forced to match the Gaussian mask tighter.
-            batch_loss += w * (spatial_mask_weight * loss + 1.0 * loss_vec)
+            # Composite Loss
+            batch_loss += w * (1.0 * loss_vec + spatial_mask_weight * loss_energy)
 
         return batch_loss
 
@@ -866,60 +826,15 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             print(f"Val Loss: {avg_test_loss:.6f} | Val Acc: {test_acc:.6f}")
             print(f"Avg Target Intensity Ratio: {avg_target_intensity_ratio:.4f}")
         
-        # Dynamic Spatial Mask Loss Weight Adjustment
-        if auto_spatial_weight_on:
-            if current_cooldown > 0:
-                current_cooldown -= 1
-            else:
-                # Use a moving average or direct evaluation to decide on step
-                # Because spatial_mask_weight scales the huge pixel-wise MSE, increasing it forces the network
-                # to concentrate energy at the expense of classification loss.
-                if test_acc >= acc_threshold and avg_target_intensity_ratio < target_ratio:
-                    spatial_mask_weight *= weight_step
-                    has_stepped_up = True
-                    if is_main_process:
-                        print(f"[*] Acc ({test_acc:.4f}) >= {acc_threshold} but Intensity ({avg_target_intensity_ratio:.4f}) < {target_ratio}.")
-                        print(f"[*] Increasing spatial_mask_loss_weight to: {spatial_mask_weight:.6f}")
-                    # Reset scheduler patience to avoid punishing the model for landscape changes
-                    if hasattr(scheduler, '_reset'):
-                        scheduler._reset()
-                        if is_main_process:
-                            print("[*] Resetting lr_scheduler patience to adapt to new loss landscape.")
-                    current_cooldown = cooldown_epochs
-                elif has_stepped_up and test_acc < (acc_threshold - 0.05):
-                    # If accuracy drops significantly, reduce the spatial constraint to let the model recover
-                    old_weight = spatial_mask_weight
-                    # Only decrease if we are significantly above 0
-                    if spatial_mask_weight > 0.0001:
-                        # Slightly larger drop to recover accuracy faster
-                        spatial_mask_weight = max(0.0001, spatial_mask_weight * 0.8)
-                        if old_weight != spatial_mask_weight:
-                            if is_main_process:
-                                print(f"[*] Acc ({test_acc:.4f}) dropped below {acc_threshold - 0.05:.2f}.")
-                                print(f"[*] Decreasing spatial_mask_loss_weight to: {spatial_mask_weight:.6f}")
-                            # Reset scheduler patience
-                            if hasattr(scheduler, '_reset'):
-                                scheduler._reset()
-                                if is_main_process:
-                                    print("[*] Resetting lr_scheduler patience to adapt to new loss landscape.")
-                            current_cooldown = cooldown_epochs
-        
         # Evaluate if this is the best model
         status_msg = ""
         # The score metric balances accuracy and spatial concentration
-        # Default: just use test_acc
-        current_score = test_acc
-        
-        # If dynamic weight is on, use a composite score: acc * (intensity_ratio ^ alpha)
-        # We need accuracy to remain high while encouraging high intensity.
-        # Alternatively, score = test_acc if test_acc < acc_threshold else test_acc + avg_target_intensity_ratio
-        if auto_spatial_weight_on:
-            # We value both. Give higher score for reaching intensity goals while maintaining acc.
-            # Example: 0.90 acc + 0.15 ratio = 1.05. 0.88 acc + 0.20 ratio = 1.08. 
-            # We weight acc more heavily to ensure it doesn't plummet just for energy.
-            acc_importance = config.get('best_model_acc_weight', 1.0)
-            int_importance = config.get('best_model_intensity_weight', 0.5)
-            current_score = (test_acc * acc_importance) + (avg_target_intensity_ratio * int_importance)
+        # We value both. Give higher score for reaching intensity goals while maintaining acc.
+        # Example: 0.90 acc + 0.15 ratio = 1.05. 0.88 acc + 0.20 ratio = 1.08. 
+        # We weight acc more heavily to ensure it doesn't plummet just for energy.
+        acc_importance = config.get('best_model_acc_weight', 1.0)
+        int_importance = config.get('best_model_intensity_weight', 0.5)
+        current_score = (test_acc * acc_importance) + (avg_target_intensity_ratio * int_importance)
 
         if current_score > best_score:
             best_score = current_score
@@ -965,11 +880,8 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         with open(log_file_path, "a") as f:
             f.write("-" * 80 + "\n")
             f.write(f"Total training time: {elapsed_time:.2f} seconds\n")
-            if auto_spatial_weight_on:
-                f.write(f"Best Validation Accuracy (associated with best score): {best_acc_for_log:.6f}\n")
-                f.write(f"Best Score: {best_score:.6f}\n")
-            else:
-                f.write(f"Best Validation Accuracy: {best_score:.6f}\n")
+            f.write(f"Best Validation Accuracy (associated with best score): {best_acc_for_log:.6f}\n")
+            f.write(f"Best Score: {best_score:.6f}\n")
         
     return elapsed_time
 

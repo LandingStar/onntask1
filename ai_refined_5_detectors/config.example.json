@@ -55,14 +55,11 @@
     "soft_label_offset": 0.25,
     "soft_label_temperature": 0.5,
 
-    "_comment_spatial_mask": "=== 空间掩膜与动态聚焦配置 ===",
-    "target_encircled_energy": 0.8,
+    "_comment_spatial_mask": "=== 空间能量惩罚约束 (Margin-based Energy Penalty) ===",
     "spatial_mask_loss_weight": 0.05,
-    
-    "auto_spatial_mask_weight": true,
     "auto_spatial_mask_target_ratio": 50.0,
-    "auto_spatial_mask_acc_threshold": 0.90,
-    "auto_spatial_mask_weight_step": 1.1,
+    "best_model_acc_weight": 1.0,
+    "best_model_intensity_weight": 0.5,
 
     "_comment_logging": "=== 日志与保存配置 ===",
     "inherit_best_model": false,

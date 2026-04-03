@@ -36,21 +36,23 @@ This document explains all available configuration parameters used in `train.py`
 - **`train_detector_bias`**: (boolean) Whether to optimize the intensity bias of each detector.
 - **`detector_pos`**: Initial `[x, y]` coordinates for the centers of the detectors.
 
-## Spatial Mask & Dynamic Focusing (New Features)
-These parameters balance Classification Accuracy and Energy Concentration (Diffraction Efficiency).
+## Spatial Energy Penalty & Composite Score (Refactored)
+These parameters balance Classification Accuracy and Energy Concentration (Diffraction Efficiency) without relying on complex dynamic if-else rules.
 
-- **`target_encircled_energy`**: (float, 0.0 ~ 1.0) **Defines the Ideal Target Shape.** 
-  Specifies the fraction of energy that *should* fall within the detector boundaries in an ideal scenario. For example, `0.8` means the target is a Gaussian spot where 80% of its energy is inside the detector. This generates the `Target Mask` for the loss function.
-- **`spatial_mask_loss_weight`**: (float) **Initial Pulling Force.** 
-  The starting weight applied to the spatial distribution loss (Pixel-wise MSE against the Target Mask). Default is `0.05`.
-
-**Dynamic Adjustment:**
-- **`auto_spatial_mask_weight`**: (boolean) Enables dynamic adjustment of `spatial_mask_loss_weight`.
+- **`spatial_mask_loss_weight`**: (float) **Energy Penalty Weight.** 
+  A constant weight applied to the energy penalty loss. This directly scales how strongly the network is penalized for having low energy concentration. Default is `0.05`.
 - **`auto_spatial_mask_target_ratio`**: (float) **The Engineering Goal.** 
-  The desired *Average Intensity Ratio* (Average Intensity inside Detector / Average Intensity of entire plane). E.g., `50.0` means the light inside the detector should be on average 50 times brighter than the background.
-- **`auto_spatial_mask_acc_threshold`**: (float) **The Safety Threshold.** 
-  The dynamic weight will *only* increase if the Validation Accuracy is above this threshold (e.g., `0.90`). If accuracy drops below `threshold - 0.1` (e.g., 0.80), the weight will automatically decrease to let the model recover.
-- **`auto_spatial_mask_weight_step`**: (float) The multiplier used to increase the weight (e.g., `1.1` increases weight by 10% per epoch when conditions are met).
+  The desired *Average Intensity Ratio* (Average Intensity inside Detector / Average Intensity of entire plane). E.g., `50.0` means the light inside the target detector should be on average 50 times brighter than the background. If the network achieves this ratio, the energy penalty becomes 0.
+- **`best_model_acc_weight`**: (float) **Accuracy Importance in Model Selection.** 
+  The weight given to Validation Accuracy when calculating the `Composite Score` to determine the best model. Default is `1.0`.
+- **`best_model_intensity_weight`**: (float) **Intensity Importance in Model Selection.** 
+  The weight given to the Intensity Ratio when calculating the `Composite Score` to determine the best model. This ensures models with slightly lower accuracy but vastly superior energy concentration can be saved. Default is `0.5`.
+
+## Distributed Data Parallel (DDP) Settings (Used in `batch_config/overall_config.json`)
+When using `batch_train.py`, you can enable multi-GPU training by adding these keys to your `overall_config.json`:
+- **`use_ddp`**: (boolean) If `true`, `batch_train.py` will launch training scripts using `torchrun` instead of standard python.
+- **`nproc_per_node`**: (string or int) Number of GPUs to use per node. Usually set to `"gpu"` to use all available GPUs, or an integer like `2`.
+- **`master_port`**: (int) The base port for DDP communication. `batch_train.py` will automatically increment this port for each parallel task to avoid collisions. Default is `29500`.
 
 ## Miscellaneous
 - **`transform_intensity`**: Scales the magnitude of data augmentations (rotation, jitter, etc.). Set to `0` to disable all augmentations except padding/resizing.
