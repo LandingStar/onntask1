@@ -10,8 +10,10 @@ This document explains all available configuration parameters used in `train.py`
 - **`epochs`**: Total number of training epochs.
 - **`batch_size`**: Training batch size. (Note: The script may auto-reduce this if VRAM is insufficient).
 - **`learning_rate`**: Initial learning rate for the Adam optimizer.
-- **`num_workers`**: Number of CPU cores to use for data loading. (Overrides auto-detection if set).
+- **`train_num_workers`**: Number of CPU cores to use for data loading in the training set.
+- **`val_num_workers`**: Number of CPU cores to use for data loading in the validation set.
 - **`prefetch_factor`**: Number of batches loaded in advance by each worker.
+- **`in_memory_dataset`**: (boolean) If `true`, the entire dataset will be pre-loaded into RAM as raw bytes to completely bypass disk I/O bottlenecks. Automatically falls back to disk if insufficient RAM is detected.
 
 ## Scheduler
 - **`scheduler_metric`**: Metric to monitor for learning rate reduction (`"acc"` or `"loss"`).
@@ -43,10 +45,21 @@ These parameters balance Classification Accuracy and Energy Concentration (Diffr
   A constant weight applied to the energy penalty loss. This directly scales how strongly the network is penalized for having low energy concentration. Default is `0.05`.
 - **`auto_spatial_mask_target_ratio`**: (float) **The Engineering Goal.** 
   The desired *Average Intensity Ratio* (Average Intensity inside Detector / Average Intensity of entire plane). E.g., `50.0` means the light inside the target detector should be on average 50 times brighter than the background. If the network achieves this ratio, the energy penalty becomes 0.
+- **`aggressive_intensity_optimization`**: (boolean) If true, dynamically amplifies the penalty weight for energy loss once the classification accuracy reaches a specific threshold.
+- **`aggressive_acc_threshold`**: (float) The validation accuracy threshold (e.g., `0.99`) required to trigger aggressive intensity optimization.
+- **`aggressive_weight_multiplier`**: (float) The multiplier factor for the `spatial_mask_loss_weight` when aggressive optimization is triggered (e.g., `5.0`).
+- **`aggressive_leaky_slope`**: (float) The negative slope for the LeakyReLU applied to the energy loss. Ensures continuous gradient push even after the `auto_spatial_mask_target_ratio` is met.
 - **`best_model_acc_weight`**: (float) **Accuracy Importance in Model Selection.** 
   The weight given to Validation Accuracy when calculating the `Composite Score` to determine the best model. Default is `1.0`.
 - **`best_model_intensity_weight`**: (float) **Intensity Importance in Model Selection.** 
   The weight given to the Intensity Ratio when calculating the `Composite Score` to determine the best model. This ensures models with slightly lower accuracy but vastly superior energy concentration can be saved. Default is `0.5`.
+
+## Misalignment Simulation (Physical Error Modeling)
+To simulate the physical manufacturing and assembly tolerances, you can inject random sub-pixel misalignment and tilt errors between layers.
+- **`simulate_misalignment`**: (boolean) Master switch. If `true`, applies random affine transformations and phase gradients before each layer (except the first layer).
+- **`misalignment_translation_max_pixels`**: (float) Maximum random in-plane translation (shift in X and Y) in pixels.
+- **`misalignment_rotation_max_degrees`**: (float) Maximum random in-plane rotation around the optical axis (Z-axis) in degrees.
+- **`misalignment_tilt_max_degrees`**: (float) Maximum random out-of-plane tilt around the X and Y axes in degrees. This simulates phase gradient ramps across the optical field.
 
 ## Distributed Data Parallel (DDP) Settings (Used in `batch_config/overall_config.json`)
 When using `batch_train.py`, you can enable multi-GPU training by adding these keys to your `overall_config.json`:

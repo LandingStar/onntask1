@@ -7,7 +7,6 @@
     "epochs": 100,
     "batch_size": 48,
     "learning_rate": 0.001,
-    "num_workers": 4,
     "prefetch_factor": 2,
 
     "_comment_scheduler": "=== 学习率调度器 (ReduceLROnPlateau) ===",
@@ -58,6 +57,10 @@
     "_comment_spatial_mask": "=== 空间能量惩罚约束 (Margin-based Energy Penalty) ===",
     "spatial_mask_loss_weight": 0.05,
     "auto_spatial_mask_target_ratio": 50.0,
+    "aggressive_intensity_optimization": true,
+    "aggressive_acc_threshold": 0.99,
+    "aggressive_weight_multiplier": 5.0,
+    "aggressive_leaky_slope": 0.1,
     "best_model_acc_weight": 1.0,
     "best_model_intensity_weight": 0.5,
 
@@ -66,5 +69,16 @@
     "save_csv_logs": true,
     "save_csv_logs_every_epoch": false,
     "run_evaluate_after_train": true,
-    "debug_eval_subprocess": false
+    "debug_eval_subprocess": false,
+
+    "_comment_system": "=== 系统与性能配置 ===",
+    "in_memory_dataset": true,
+    "train_num_workers": 4,
+    "val_num_workers": 1,
+
+    "_comment_misalignment": "=== 物理装配误差模拟 ===",
+    "simulate_misalignment": false,
+    "misalignment_translation_max_pixels": 2.0,
+    "misalignment_rotation_max_degrees": 0.5,
+    "misalignment_tilt_max_degrees": 0.1
 }

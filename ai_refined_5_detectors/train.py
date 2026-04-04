@@ -373,7 +373,7 @@ class DNN(torch.nn.Module):
         self.detector_mask = torch.nn.Parameter(torch.ones(num_classes))
         self.detector_minus = torch.nn.Parameter(torch.zeros(num_classes))
         
-        # Detector positions
+        # Initialize detector positions
         self.detector_pos = torch.nn.Parameter(torch.tensor(detector_pos_xy, dtype=torch.float32))
         
         # Enable/Disable gradient for detector positions
@@ -406,6 +406,75 @@ class DNN(torch.nn.Module):
         self.diffractive_layers = torch.nn.ModuleList([Diffractive_Layer(wl, PhaseMask, pixel_size, distance_between_layers) for _ in range(num_layers)])
         self.last_diffractive_layer = Propagation_Layer(wl, PhaseMask, pixel_size, distance_to_detectors)
 
+        # Misalignment Layer Simulation
+        self.simulate_misalignment = config.get('simulate_misalignment', False)
+        self.misalignment_translation_max = config.get('misalignment_translation_max_pixels', 2.0)
+        self.misalignment_rotation_max = config.get('misalignment_rotation_max_degrees', 0.5)
+        self.misalignment_tilt_max = config.get('misalignment_tilt_max_degrees', 0.1)
+        
+        # Pre-compute coordinate grid for tilt phase gradient (efficiency)
+        # We only need this if tilt is enabled and > 0
+        if self.simulate_misalignment and self.misalignment_tilt_max > 0:
+            # Physical coordinates (x, y) based on pixel size
+            # Center is at (0, 0)
+            x_range = (torch.arange(PhaseMask[1], dtype=torch.float32, device=device) - PhaseMask[1] / 2) * pixel_size
+            y_range = (torch.arange(PhaseMask[0], dtype=torch.float32, device=device) - PhaseMask[0] / 2) * pixel_size
+            self.yy, self.xx = torch.meshgrid(y_range, x_range, indexing='ij')
+            # Wavenumber k = 2pi / lambda
+            self.k = 2 * np.pi / wl
+
+    def apply_misalignment(self, E):
+        if not self.training or not self.simulate_misalignment:
+            return E
+            
+        batch_size = E.shape[0]
+        
+        # 1. Random translation (shift in x and y)
+        shift_x = (torch.rand(batch_size, device=device) * 2 - 1) * self.misalignment_translation_max
+        shift_y = (torch.rand(batch_size, device=device) * 2 - 1) * self.misalignment_translation_max
+        
+        # 2. In-plane rotation (around Z axis)
+        angle_rad = (torch.rand(batch_size, device=device) * 2 - 1) * self.misalignment_rotation_max * np.pi / 180.0
+        cos_a = torch.cos(angle_rad)
+        sin_a = torch.sin(angle_rad)
+        
+        # Normalized translation for grid_sample (-1 to 1)
+        tx = shift_x / (E.shape[3] / 2)
+        ty = shift_y / (E.shape[2] / 2)
+        
+        affine_matrix = torch.zeros(batch_size, 2, 3, device=device)
+        affine_matrix[:, 0, 0] = cos_a
+        affine_matrix[:, 0, 1] = -sin_a
+        affine_matrix[:, 0, 2] = tx
+        affine_matrix[:, 1, 0] = sin_a
+        affine_matrix[:, 1, 1] = cos_a
+        affine_matrix[:, 1, 2] = ty
+        
+        # Grid sample requires real tensors (Channels=2 for complex)
+        E_real = E.real.unsqueeze(1) # [B, 1, H, W]
+        E_imag = E.imag.unsqueeze(1)
+        E_concat = torch.cat([E_real, E_imag], dim=1) # [B, 2, H, W]
+        
+        grid = F.affine_grid(affine_matrix, E_concat.size(), align_corners=False)
+        E_warped = F.grid_sample(E_concat, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+        
+        E_out = torch.complex(E_warped[:, 0], E_warped[:, 1])
+        
+        # 3. Out-of-plane tilt (around X and Y axis -> Phase gradient)
+        if self.misalignment_tilt_max > 0:
+            # Tilt angles in radians
+            tilt_x = (torch.rand(batch_size, 1, 1, device=device) * 2 - 1) * self.misalignment_tilt_max * np.pi / 180.0
+            tilt_y = (torch.rand(batch_size, 1, 1, device=device) * 2 - 1) * self.misalignment_tilt_max * np.pi / 180.0
+            
+            # Phase gradient = k * (x * sin(tilt_y) + y * sin(tilt_x))
+            # For small angles, sin(theta) ≈ theta
+            phase_gradient = self.k * (self.xx.unsqueeze(0) * tilt_y + self.yy.unsqueeze(0) * tilt_x)
+            tilt_phasor = torch.exp(1j * phase_gradient)
+            
+            E_out = E_out * tilt_phasor
+            
+        return E_out
+
     def forward(self, E):
         # Apply Jitter
         current_detector_pos = self.detector_pos
@@ -419,6 +488,9 @@ class DNN(torch.nn.Module):
 
         E = E.to(torch.cfloat)
         for index, layer in enumerate(self.diffractive_layers):
+            if index > 0 and self.simulate_misalignment:
+                E = self.apply_misalignment(E)
+                
             temp = layer(E)
             phase_values = 2 * torch.pi * self.phase_mask[index]
             modulation = torch.exp(1j * phase_values)

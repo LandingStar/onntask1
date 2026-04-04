@@ -89,6 +89,10 @@
             600.0
         ]
     ],
+    "simulate_misalignment": true,
+    "misalignment_translation_max_pixels": 2.0,
+    "misalignment_rotation_max_degrees": 0.5,
+    "misalignment_tilt_max_degrees": 0.1,
     "in_memory_dataset": true,
     "batch_train": true
 }
