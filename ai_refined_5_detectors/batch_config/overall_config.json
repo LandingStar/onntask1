@@ -10,6 +10,8 @@
     "scheduler_patience": 10,
     "scheduler_metric" : "acc",
     "spatial_mask_loss_weight": 0.02,
+
+    "aggressive_leaky_slope": 0.1,
     
     "auto_spatial_mask_target_ratio": 25.0,
     "best_model_acc_weight": 1.0,
@@ -17,5 +19,7 @@
 
     "use_ddp": false,
     "nproc_per_node": "gpu",
+    "in_memory_dataset": true,
     "master_port": 29500
+
 }

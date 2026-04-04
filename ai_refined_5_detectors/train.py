@@ -501,6 +501,10 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     spatial_mask_weight = float(config.get('spatial_mask_loss_weight', 0.05))
     target_ratio = config.get('auto_spatial_mask_target_ratio', 0.1)
     
+    aggressive_intensity_optimization = config.get('aggressive_intensity_optimization', True)
+    aggressive_acc_threshold = config.get('aggressive_acc_threshold', 0.99)
+    aggressive_weight_multiplier = config.get('aggressive_weight_multiplier', 5.0)
+    
     if label_num >= 2 * num_classes:
         # num_classes += 1 # Disable for 5-detector specific task
         pass
@@ -547,7 +551,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         
     start_time = time.time()
 
-    def compute_loss(images, labels, out_img, output_vec):
+    def compute_loss(images, labels, out_img, output_vec, current_spatial_weight, is_aggressive=False):
         det_shape = config.get('detector_shape', 'circle')
         det_size_config = config.get('detector_size', 60)
         
@@ -603,7 +607,15 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         
         # 2. Target Energy Penalty (Batch-wise)
         current_target_intensity_ratio = (output_vec * target_mask_weight).sum(dim=1) * area_ratio
-        loss_energy = F.relu(target_ratio - current_target_intensity_ratio)
+        
+        if is_aggressive:
+            # Switch to LeakyReLU (or softplus) to keep pushing intensity even after target_ratio is met.
+            # Normal ReLU clips negative values to 0 (meaning zero loss/gradient once target is met).
+            # LeakyReLU with slope 0.1 provides continuous gradient to keep improving intensity indefinitely.
+            aggressive_slope = config.get('aggressive_leaky_slope', 0.1)
+            loss_energy = F.leaky_relu(target_ratio - current_target_intensity_ratio, negative_slope=aggressive_slope)
+        else:
+            loss_energy = F.relu(target_ratio - current_target_intensity_ratio)
         
         # Apply detector weights
         det_weights_list = config.get('detector_loss_weight', None)
@@ -614,7 +626,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             w = torch.ones(batch_size, device=device, dtype=torch.float32)
             
         # Composite Loss
-        batch_loss = (w * (1.0 * loss_vec + spatial_mask_weight * loss_energy)).sum()
+        batch_loss = (w * (1.0 * loss_vec + current_spatial_weight * loss_energy)).sum()
 
         return batch_loss
 
@@ -652,6 +664,16 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         total = 0
         
         pbar = tqdm(trainloader, desc=f"Epoch {epoch+1}/{epochs}")
+        
+        # Determine current epoch's spatial mask weight
+        current_epoch_spatial_weight = spatial_mask_weight
+        is_aggressive = False
+        if aggressive_intensity_optimization and epoch > 0:
+            # Use previous epoch's test accuracy to decide
+            if len(test_acc_hist) > 0 and test_acc_hist[-1] >= aggressive_acc_threshold:
+                current_epoch_spatial_weight = spatial_mask_weight * aggressive_weight_multiplier
+                is_aggressive = True
+                
         for images, labels in pbar:
             optimizer.zero_grad()
             images = images.to(device).float()
@@ -677,7 +699,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             
             out_label, out_img, penalty_per_det = model(images_input)
             
-            loss = compute_loss(images_input, labels, out_img, out_label)
+            loss = compute_loss(images_input, labels, out_img, out_label, current_epoch_spatial_weight, is_aggressive)
             # Only penalize target detectors (not all detectors)
             target_det = labels // 4
             target_penalty = penalty_per_det[torch.arange(len(labels), device=device), target_det]
@@ -750,7 +772,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                     
                 out_label, out_img, penalty_per_det = model(images_input)
                 
-                loss = compute_loss(images_input, labels, out_img, out_label)
+                loss = compute_loss(images_input, labels, out_img, out_label, current_epoch_spatial_weight, is_aggressive)
                 target_det = labels // 4
                 target_penalty = penalty_per_det[torch.arange(len(labels), device=device), target_det]
                 loss += target_penalty.sum()
@@ -821,6 +843,8 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             
         if is_main_process:
             print(f"Epoch {epoch+1} Results:")
+            if is_aggressive:
+                print(f"** AGGRESSIVE OPTIMIZATION ACTIVE ** (Acc >= {aggressive_acc_threshold}, Weight: x{aggressive_weight_multiplier})")
             print(f"Train Loss: {avg_train_loss:.6f} | Train Acc: {train_acc:.6f}")
             print(f"Val Loss: {avg_test_loss:.6f} | Val Acc: {test_acc:.6f}")
             print(f"Avg Target Intensity Ratio: {avg_target_intensity_ratio:.4f}")
@@ -844,7 +868,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             
             # Write to log file
             with open(log_file_path, "a") as f:
-                f.write(f"{epoch+1:5d} | {avg_train_loss:10.6f} | {train_acc:9.4f} | {avg_test_loss:8.6f} | {test_acc:7.4f} | {current_lr:.2e} | {avg_target_intensity_ratio:7.4f} | {spatial_mask_weight:7.4f} | {epoch_time:7.2f} | {status_msg}\n")
+                f.write(f"{epoch+1:5d} | {avg_train_loss:10.6f} | {train_acc:9.4f} | {avg_test_loss:8.6f} | {test_acc:7.4f} | {current_lr:.2e} | {avg_target_intensity_ratio:7.4f} | {current_epoch_spatial_weight:7.4f} | {epoch_time:7.2f} | {status_msg}\n")
             
             # Plotting - move to a background thread to prevent blocking the next epoch
             import threading
