@@ -85,5 +85,6 @@
             600.0
         ]
     ],
+    "in_memory_dataset": true,
     "batch_train": true
 }

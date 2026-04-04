@@ -548,11 +548,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     start_time = time.time()
 
     def compute_loss(images, labels, out_img, output_vec):
-        full_int_img = out_img.sum(axis=(1, 2))
-        normalized_out_img = out_img / (full_int_img[:, None, None] + 1e-8)
-        
-        batch_loss = torch.tensor(0.0, device=device)
-        
         det_shape = config.get('detector_shape', 'circle')
         det_size_config = config.get('detector_size', 60)
         
@@ -564,20 +559,20 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         global_area = PhaseMask[0] * PhaseMask[1]
         area_ratio = global_area / det_area
 
-        for i in range(images.size(0)):
-            sample_label = labels[i].item()
-            sample_img = normalized_out_img[i]
-            
-            target_mask_weight = torch.full((classes_num,), minus_mask_ratio, device=device, dtype=torch.float32)
-            
-            # Mapping: 20 labels → 5 detectors (4-to-1)
-            base_det = sample_label // 4
-            
-            soft_label_on = config.get('soft_label_enabled', False)
-            if soft_label_on:
-                # Soft label mode: boundary labels (rem 0, 3) split energy between adjacent detectors
-                rem = sample_label % 4
-                sl_offset = config.get('soft_label_offset', 0.25)
+        # Vectorized label mapping
+        base_det = labels // 4
+        
+        soft_label_on = config.get('soft_label_enabled', False)
+        batch_size = images.size(0)
+        target_mask_weight = torch.full((batch_size, classes_num), minus_mask_ratio, device=device, dtype=torch.float32)
+        
+        if soft_label_on:
+            # We process this row by row for now since soft labels have complex logic, 
+            # but it's much faster than doing the whole loss loop row by row.
+            sl_offset = config.get('soft_label_offset', 0.25)
+            temp = config.get('soft_label_temperature', 0.5)
+            for i in range(batch_size):
+                rem = labels[i].item() % 4
                 if rem == 1 or rem == 2:
                     offset = 0.0
                 elif rem == 0:
@@ -585,43 +580,41 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 else:  # rem == 3
                     offset = sl_offset
                     
-                target_float = max(0.0, min(base_det + offset, 4.0))
+                target_float = max(0.0, min(base_det[i].item() + offset, 4.0))
                 floor_idx = int(math.floor(target_float))
                 ceil_idx = int(math.ceil(target_float))
                 
                 if floor_idx == ceil_idx:
-                    target_mask_weight[floor_idx] = 1.0
+                    target_mask_weight[i, floor_idx] = 1.0
                 else:
                     weight_ceil = target_float - floor_idx
-                    target_mask_weight[floor_idx] = 1.0 - weight_ceil
-                    target_mask_weight[ceil_idx] = weight_ceil
-                    # Temperature scaling: flatten distribution (e.g. [0.75, 0.25] → ~[0.63, 0.37])
-                    temp = config.get('soft_label_temperature', 0.5)
-                    target_mask_weight = torch.pow(target_mask_weight, temp)
-                    target_mask_weight = target_mask_weight / target_mask_weight.sum()
-            else:
-                # Hard label mode: each label maps to exactly one detector
-                target_mask_weight[base_det] = 1.0
+                    target_mask_weight[i, floor_idx] = 1.0 - weight_ceil
+                    target_mask_weight[i, ceil_idx] = weight_ceil
+                    
+                    target_mask_weight[i] = torch.pow(target_mask_weight[i], temp)
+                    target_mask_weight[i] = target_mask_weight[i] / target_mask_weight[i].sum()
+        else:
+            # Fast vectorized hard label mapping
+            target_mask_weight.scatter_(1, base_det.unsqueeze(1), 1.0)
             
-            # 1. Vector Loss (Classification / Distribution matching)
-            # This ensures the correct detectors get the majority of the energy sum
-            loss_vec = F.mse_loss(output_vec[i], target_mask_weight)
+        # 1. Vector Loss (Batch-wise)
+        # Using reduction='none' so we can apply individual detector weights
+        loss_vec = F.mse_loss(output_vec, target_mask_weight, reduction='none').mean(dim=1)
+        
+        # 2. Target Energy Penalty (Batch-wise)
+        current_target_intensity_ratio = (output_vec * target_mask_weight).sum(dim=1) * area_ratio
+        loss_energy = F.relu(target_ratio - current_target_intensity_ratio)
+        
+        # Apply detector weights
+        det_weights_list = config.get('detector_loss_weight', None)
+        if det_weights_list:
+            det_weights_tensor = torch.tensor(det_weights_list, device=device, dtype=torch.float32)
+            w = det_weights_tensor[base_det]
+        else:
+            w = torch.ones(batch_size, device=device, dtype=torch.float32)
             
-            # 2. Target Energy Penalty (Spatial Concentration)
-            # output_vec[i] contains the sum ratios for all detectors.
-            # target_mask_weight defines the ideal ratios.
-            # We want the average intensity ratio inside the target detector(s) to reach `target_ratio`.
-            # Intensity Ratio = Sum Ratio * (Global_Area / Det_Area)
-            current_target_intensity_ratio = (output_vec[i] * target_mask_weight).sum() * area_ratio
-            
-            # Only penalize if it's below the target_ratio
-            loss_energy = F.relu(target_ratio - current_target_intensity_ratio)
-            
-            det_weights = config.get('detector_loss_weight', None)
-            w = det_weights[base_det] if det_weights else 1.0
-            
-            # Composite Loss
-            batch_loss += w * (1.0 * loss_vec + spatial_mask_weight * loss_energy)
+        # Composite Loss
+        batch_loss = (w * (1.0 * loss_vec + spatial_mask_weight * loss_energy)).sum()
 
         return batch_loss
 
@@ -805,10 +798,22 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         test_loss_hist.append(avg_test_loss)
         test_acc_hist.append(test_acc)
         
+        # Evaluate if this is the best model
+        status_msg = ""
+        # The score metric balances accuracy and spatial concentration
+        # We value both. Give higher score for reaching intensity goals while maintaining acc.
+        # Example: 0.90 acc + 0.15 ratio = 1.05. 0.88 acc + 0.20 ratio = 1.08. 
+        # We weight acc more heavily to ensure it doesn't plummet just for energy.
+        acc_importance = config.get('best_model_acc_weight', 1.0)
+        int_importance = config.get('best_model_intensity_weight', 0.5)
+        current_score = (test_acc * acc_importance) + (avg_target_intensity_ratio * int_importance)
+
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler_metric = config.get('scheduler_metric', 'acc')
             if scheduler_metric == 'acc':
-                scheduler.step(test_acc)
+                # Use current_score instead of pure acc, so that LR doesn't drop 
+                # if intensity is improving while acc is plateaued.
+                scheduler.step(current_score)
             else:
                 scheduler.step(avg_test_loss)
         else:
@@ -819,16 +824,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             print(f"Train Loss: {avg_train_loss:.6f} | Train Acc: {train_acc:.6f}")
             print(f"Val Loss: {avg_test_loss:.6f} | Val Acc: {test_acc:.6f}")
             print(f"Avg Target Intensity Ratio: {avg_target_intensity_ratio:.4f}")
-        
-        # Evaluate if this is the best model
-        status_msg = ""
-        # The score metric balances accuracy and spatial concentration
-        # We value both. Give higher score for reaching intensity goals while maintaining acc.
-        # Example: 0.90 acc + 0.15 ratio = 1.05. 0.88 acc + 0.20 ratio = 1.08. 
-        # We weight acc more heavily to ensure it doesn't plummet just for energy.
-        acc_importance = config.get('best_model_acc_weight', 1.0)
-        int_importance = config.get('best_model_intensity_weight', 0.5)
-        current_score = (test_acc * acc_importance) + (avg_target_intensity_ratio * int_importance)
+            print(f"Composite Score: {current_score:.4f}")
 
         if current_score > best_score:
             best_score = current_score
@@ -879,11 +875,106 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         
     return elapsed_time
 
+import io
+from PIL import Image
+
+class InMemoryImageFolder(torchvision.datasets.ImageFolder):
+    def __init__(self, root, transform=None, target_transform=None):
+        super().__init__(root, transform=transform, target_transform=target_transform)
+        self.samples_in_memory = []
+        print(f"Loading {len(self.samples)} images into memory from {root}...")
+        for path, target in tqdm(self.samples, desc=f"Loading {os.path.basename(root)} to RAM"):
+            with open(path, 'rb') as f:
+                # We store the raw bytes instead of decoded Tensors/PIL Images.
+                # This prevents RAM explosion (10GB disk space -> 400GB+ float32 RAM)
+                # while still completely bypassing remote disk I/O latency.
+                self.samples_in_memory.append((f.read(), target))
+        print("Done loading into memory.")
+
+    def __getitem__(self, index):
+        img_bytes, target = self.samples_in_memory[index]
+        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+        if self.transform is not None:
+            img = self.transform(img)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+        return img, target
+
+def get_dir_size(path):
+    total_size = 0
+    if not os.path.exists(path):
+        return 0
+    for dirpath, _, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            if not os.path.islink(fp):
+                total_size += os.path.getsize(fp)
+    return total_size
+
+def get_available_memory():
+    try:
+        import psutil
+        return psutil.virtual_memory().available
+    except ImportError:
+        import platform
+        if platform.system() == 'Windows':
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return stat.ullAvailPhys
+        elif platform.system() == 'Linux':
+            try:
+                with open('/proc/meminfo', 'r') as f:
+                    for line in f:
+                        if 'MemAvailable' in line:
+                            return int(line.split()[1]) * 1024
+            except:
+                pass
+    return None
+
 if __name__ == "__main__":
     try:
-        # Use Standard ImageFolder (all 20 classes)
-        train_dataset = torchvision.datasets.ImageFolder(f"{dataset_name}/train", transform=cpu_transform)
-        val_dataset = torchvision.datasets.ImageFolder(f"{dataset_name}/val", transform=cpu_transform)
+        # Use Standard ImageFolder or InMemoryImageFolder based on config
+        use_in_memory = config.get('in_memory_dataset', True) # Enabled by default for faster I/O
+        
+        if use_in_memory:
+            train_dir = f"{dataset_name}/train"
+            val_dir = f"{dataset_name}/val"
+            dataset_size = get_dir_size(train_dir) + get_dir_size(val_dir)
+            avail_mem = get_available_memory()
+
+            if avail_mem is not None:
+                # Require dataset size + 20% overhead + 2GB safety margin
+                required_mem = dataset_size * 1.2 + (2 * 1024**3)
+                print(f"[Memory Check] Dataset Size: {dataset_size / 1024**3:.2f} GB, Available RAM: {avail_mem / 1024**3:.2f} GB")
+                if required_mem > avail_mem:
+                    print(f"[Memory Check] Insufficient RAM! Required ~{required_mem / 1024**3:.2f} GB. Falling back to disk I/O.")
+                    use_in_memory = False
+                else:
+                    print("[Memory Check] Sufficient RAM available. Proceeding with in-memory dataset.")
+            else:
+                print("[Memory Check] Could not determine available RAM. Attempting in-memory load anyway...")
+
+        if use_in_memory:
+            print("Using InMemoryImageFolder to bypass I/O bottlenecks...")
+            train_dataset = InMemoryImageFolder(f"{dataset_name}/train", transform=cpu_transform)
+            val_dataset = InMemoryImageFolder(f"{dataset_name}/val", transform=cpu_transform)
+        else:
+            train_dataset = torchvision.datasets.ImageFolder(f"{dataset_name}/train", transform=cpu_transform)
+            val_dataset = torchvision.datasets.ImageFolder(f"{dataset_name}/val", transform=cpu_transform)
         
         # DataLoader configurations for better performance
         # Detect available CPU cores
