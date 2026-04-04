@@ -21,7 +21,7 @@ import torchvision.transforms.v2 as v2
 # 4. Local imports
 from train import DNN, cpu_transform
 
-def evaluate():
+def evaluate(custom_val_dataset=None):
     # 1. Find the latest result directory first
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     
@@ -72,18 +72,27 @@ def evaluate():
     
     # Auto-adjust BATCH_SIZE for evaluation based on VRAM to prevent OOM
     if torch.cuda.is_available():
-        # Get total VRAM in GB
-        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        # Empirical scaling: 128 batch size takes ~4GB, 256 takes ~8GB for this model
+        # Get total VRAM in GB and SM count
+        device_props = torch.cuda.get_device_properties(0)
+        total_vram_gb = device_props.total_memory / (1024**3)
+        sm_count = device_props.multi_processor_count
+        
+        # Calculate optimal async batch size based on SM count
+        # (Same logic as in train.py to maximize overlap and parallel efficiency)
+        optimal_async_batch = max(16, int(sm_count * 0.75))
+        
         if total_vram_gb < 6.0:
-            BATCH_SIZE = min(BATCH_SIZE, 32)
+            BATCH_SIZE = min(BATCH_SIZE, 16)
         elif total_vram_gb < 10.0:
-            BATCH_SIZE = min(BATCH_SIZE, 64)
+            BATCH_SIZE = min(BATCH_SIZE, 32)
         elif total_vram_gb < 16.0:
-            BATCH_SIZE = min(BATCH_SIZE, 128)
+            BATCH_SIZE = min(BATCH_SIZE, max(48, optimal_async_batch))
         else:
-            BATCH_SIZE = min(BATCH_SIZE, 256)
-        print(f"Auto-adjusted BATCH_SIZE to {BATCH_SIZE} based on {total_vram_gb:.1f}GB VRAM.")
+            # If VRAM is abundant, cap at the SM-optimized async batch size rather than a hard 256
+            # We can afford to be slightly more aggressive in eval than train, so we use * 3
+            BATCH_SIZE = min(BATCH_SIZE, optimal_async_batch * 3)
+            
+        print(f"Auto-adjusted BATCH_SIZE to {BATCH_SIZE} based on {total_vram_gb:.1f}GB VRAM and {sm_count} SMs.")
     
     IMG_SIZE = config.get('img_size', [1000, 1000])
     PhaseMask = config.get('phase_mask_size', [1200, 1200])
@@ -141,8 +150,18 @@ def evaluate():
         dataset_name = dataset_path_config
     
     try:
-        # Use Standard ImageFolder (all 20 classes)
-        val_dataset = torchvision.datasets.ImageFolder(f"{dataset_name}/val", transform=cpu_transform)
+        if custom_val_dataset is not None:
+            print("Evaluation: Using custom validation dataset passed from memory.")
+            val_dataset = custom_val_dataset
+        else:
+            # Check if in-memory dataset was used
+            use_in_memory = config.get('in_memory_dataset', True)
+            if use_in_memory:
+                from train import InMemoryImageFolder
+                print("Evaluation: Using InMemoryImageFolder...")
+                val_dataset = InMemoryImageFolder(f"{dataset_name}/val", transform=cpu_transform)
+            else:
+                val_dataset = torchvision.datasets.ImageFolder(f"{dataset_name}/val", transform=cpu_transform)
         # Shuffle=True for better visualization coverage
         val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     except Exception as e:
@@ -224,6 +243,10 @@ def evaluate():
     batch_count = 0
     
     for images, labels in val_dataloader:
+        # Evaluate should also use non-blocking async transfer for performance
+        images = images.to(device, non_blocking=True).float()
+        labels = labels.to(device, non_blocking=True)
+        
         for i in range(len(labels)):
             lbl = labels[i].item()
             if lbl in target_labels_set and lbl not in target_labels_found:
@@ -392,7 +415,8 @@ def evaluate():
     print("Computing confusion matrix...")
     with torch.no_grad():
         for images, labels in val_dataloader:
-            images = images.to(device).float()
+            images = images.to(device, non_blocking=True).float()
+            labels = labels.to(device, non_blocking=True)
             
             images_aug = gpu_transform_val(images)
             

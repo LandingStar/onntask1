@@ -98,16 +98,26 @@ else:
 BATCH_SIZE = config.get('batch_size', 48)
 
 # Auto-adjust BATCH_SIZE for training based on VRAM to prevent OOM
+# Note: Since we use non_blocking async data transfer to GPU, smaller batches are actually better
+# because they allow fine-grained overlapping of PCIe transfer and GPU FFT computation.
 if torch.cuda.is_available():
-    total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    device_props = torch.cuda.get_device_properties(0)
+    total_vram_gb = device_props.total_memory / (1024**3)
+    sm_count = device_props.multi_processor_count
+    
+    optimal_async_batch = max(16, int(sm_count * 0.75))
+    
     if total_vram_gb < 6.0:
-        BATCH_SIZE = min(BATCH_SIZE, 32)
+        BATCH_SIZE = min(BATCH_SIZE, 16)
     elif total_vram_gb < 10.0:
-        BATCH_SIZE = min(BATCH_SIZE, 64)
+        BATCH_SIZE = min(BATCH_SIZE, 32)
     elif total_vram_gb < 16.0:
-        BATCH_SIZE = min(BATCH_SIZE, 128)
+        BATCH_SIZE = min(BATCH_SIZE, max(48, optimal_async_batch))
+    else:
+        # If VRAM is abundant, cap at the SM-optimized async batch size rather than a hard 64
+        BATCH_SIZE = min(BATCH_SIZE, optimal_async_batch * 2)
     # else keep config's BATCH_SIZE (could be 256 or higher)
-    print(f"Auto-adjusted training BATCH_SIZE to {BATCH_SIZE} based on {total_vram_gb:.1f}GB VRAM.")
+    print(f"Auto-adjusted training BATCH_SIZE to {BATCH_SIZE} based on {total_vram_gb:.1f}GB VRAM and {sm_count} SMs.")
 
 IMG_SIZE = config.get('img_size', [1000, 1000])
 PhaseMask = config.get('phase_mask_size', [1200, 1200])
@@ -748,7 +758,10 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 
         for images, labels in pbar:
             optimizer.zero_grad()
-            images = images.to(device).float()
+            
+            # Asynchronous data transfer to GPU (overlap compute & transfer)
+            images = images.to(device, non_blocking=True).float()
+            labels = labels.to(device, non_blocking=True)
             
             with torch.no_grad():
                 images_aug = gpu_transform(images)
@@ -762,14 +775,13 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             # PADDINGx is (1200-1000)//2 = 100.
             # gpu_transform adds 100 padding.
             # If input is 1000, output is 1200.
-            if images_squeezed.shape[-1] == PhaseMask[0]:
-                 images_input = images_squeezed
-            else:
-                 images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
-            
-            labels = labels.to(device)
-            
-            out_label, out_img, penalty_per_det = model(images_input)
+                # Apply padding (can also be done async if using appropriate padding module)
+                if images_squeezed.shape[-1] == PhaseMask[0]:
+                     images_input = images_squeezed
+                else:
+                     images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
+                
+                out_label, out_img, penalty_per_det = model(images_input)
             
             loss = compute_loss(images_input, labels, out_img, out_label, current_epoch_spatial_weight, is_aggressive)
             # Only penalize target detectors (not all detectors)
@@ -825,12 +837,11 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         
         with torch.no_grad():
             for images, labels in testloader:
-                images = images.to(device).float()
+                # Asynchronous transfer
+                images = images.to(device, non_blocking=True).float()
+                labels = labels.to(device, non_blocking=True)
                 
                 # Apply validation transforms on GPU (Resize)
-                images_aug = gpu_transform_val(images)
-                
-                labels = labels.to(device)
                 
                 if images_aug.shape[1] == 1:
                     images_squeezed = images_aug.squeeze(1)
@@ -975,17 +986,30 @@ import io
 from PIL import Image
 
 class InMemoryImageFolder(torchvision.datasets.ImageFolder):
+    # Class-level cache dictionary to share memory across instances and imports within the same process
+    # Key: absolute path to the dataset directory (e.g., '/path/to/dataset/train')
+    # Value: list of tuples (img_bytes, target)
+    _SHARED_CACHE = {}
+
     def __init__(self, root, transform=None, target_transform=None):
         super().__init__(root, transform=transform, target_transform=target_transform)
-        self.samples_in_memory = []
-        print(f"Loading {len(self.samples)} images into memory from {root}...")
-        for path, target in tqdm(self.samples, desc=f"Loading {os.path.basename(root)} to RAM"):
-            with open(path, 'rb') as f:
-                # We store the raw bytes instead of decoded Tensors/PIL Images.
-                # This prevents RAM explosion (10GB disk space -> 400GB+ float32 RAM)
-                # while still completely bypassing remote disk I/O latency.
-                self.samples_in_memory.append((f.read(), target))
-        print("Done loading into memory.")
+        abs_root = os.path.abspath(root)
+        
+        if abs_root in self.__class__._SHARED_CACHE:
+            print(f"Dataset already in RAM cache. Reusing {len(self.samples)} images from {root}...")
+            self.samples_in_memory = self.__class__._SHARED_CACHE[abs_root]
+        else:
+            self.samples_in_memory = []
+            print(f"Loading {len(self.samples)} images into memory from {root}...")
+            for path, target in tqdm(self.samples, desc=f"Loading {os.path.basename(root)} to RAM"):
+                with open(path, 'rb') as f:
+                    # We store the raw bytes instead of decoded Tensors/PIL Images.
+                    # This prevents RAM explosion (10GB disk space -> 400GB+ float32 RAM)
+                    # while still completely bypassing remote disk I/O latency.
+                    self.samples_in_memory.append((f.read(), target))
+            print("Done loading into memory.")
+            # Store in class-level cache for future instantiations in the same process
+            self.__class__._SHARED_CACHE[abs_root] = self.samples_in_memory
 
     def __getitem__(self, index):
         img_bytes, target = self.samples_in_memory[index]
@@ -1041,7 +1065,188 @@ def get_available_memory():
                 pass
     return None
 
-if __name__ == "__main__":
+def main():
+    # 1. We need to clear/reset the state for consecutive inline runs
+    global config, BATCH_SIZE, IMG_SIZE, PhaseMask, PIXEL_SIZE, wl, PADDINGx, PADDINGy, dataset_name, gpu_transform, gpu_transform_val, cpu_transform, device, is_ddp, local_rank, world_size, detector_pos_xy
+    
+    # Check if a custom config path was passed as an argument
+    is_custom_config = False
+    is_subprocess = False
+    config_path = os.path.join(BASE_DIR, 'config.json')
+    
+    for arg in sys.argv[1:]:
+        if arg == "--is-subprocess":
+            is_subprocess = True
+        elif arg.endswith('.json'):
+            custom_config = arg
+            if os.path.isabs(custom_config):
+                config_path = custom_config
+            else:
+                config_path = os.path.join(BASE_DIR, custom_config)
+            is_custom_config = True
+            
+    config = {}
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+    
+    # Intercept for batch training if configured
+    # BUT ONLY IF we are reading the default config.json AND we are not a subprocess
+    # Also ensure batch_train doesn't trigger if launched via torchrun (LOCAL_RANK exists)
+    if config.get('batch_train', False) and not is_subprocess and "LOCAL_RANK" not in os.environ and not is_custom_config:
+        print(f"\n[INFO] 'batch_train' flag is true in config.json. Redirecting to batch_train.py...")
+        import subprocess
+        try:
+            # Run batch_train.py in the same directory
+            result = subprocess.run([sys.executable, os.path.join(BASE_DIR, 'batch_train.py')], check=False)
+            sys.exit(result.returncode)
+        except Exception as e:
+            print(f"Batch training execution failed: {e}")
+            sys.exit(1)
+
+    # DDP Initialization
+    is_ddp = "LOCAL_RANK" in os.environ
+    if is_ddp:
+        # Prevent re-initializing process group if already initialized (inline batch runs)
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        device = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(device)
+        world_size = dist.get_world_size()
+    else:
+        local_rank = 0
+        world_size = 1
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    BATCH_SIZE = config.get('batch_size', 48)
+
+    # Auto-adjust BATCH_SIZE for training based on VRAM to prevent OOM
+    # Note: Since we use non_blocking async data transfer to GPU, smaller batches are actually better
+    # because they allow fine-grained overlapping of PCIe transfer and GPU FFT computation.
+    if torch.cuda.is_available():
+        device_props = torch.cuda.get_device_properties(0)
+        total_vram_gb = device_props.total_memory / (1024**3)
+        sm_count = device_props.multi_processor_count
+        
+        # Calculate optimal async batch size based on SM count (Streaming Multiprocessors)
+        # To keep all SMs busy but maintain high-frequency PCIe transfers, 
+        # a good rule of thumb is 0.5 to 1 batch item per SM.
+        # For example, RTX 3090 has 82 SMs -> optimal async batch ~41-82
+        # A100 has 108 SMs -> optimal async batch ~54-108
+        optimal_async_batch = max(16, int(sm_count * 0.75))
+        
+        if total_vram_gb < 6.0:
+            BATCH_SIZE = min(BATCH_SIZE, 16)
+        elif total_vram_gb < 10.0:
+            BATCH_SIZE = min(BATCH_SIZE, 32)
+        elif total_vram_gb < 16.0:
+            BATCH_SIZE = min(BATCH_SIZE, max(48, optimal_async_batch))
+        else:
+            # If VRAM is abundant, cap at the SM-optimized async batch size rather than a hard 64
+            BATCH_SIZE = min(BATCH_SIZE, optimal_async_batch * 2)
+            
+        print(f"Auto-adjusted training BATCH_SIZE to {BATCH_SIZE} (VRAM: {total_vram_gb:.1f}GB, SMs: {sm_count}).")
+            
+    IMG_SIZE = config.get('img_size', [1000, 1000])
+    PhaseMask = config.get('phase_mask_size', [1200, 1200])
+    PIXEL_SIZE = config.get('pixel_size', 8e-6)
+    wl = config.get('wavelength', 532e-9)
+    PADDINGx = (PhaseMask[0] - IMG_SIZE[0]) // 2
+    PADDINGy = (PhaseMask[1] - IMG_SIZE[1]) // 2
+
+    # Dataset Paths
+    dataset_path_config = config.get('dataset_path', './dataset')
+
+    # Resolve dataset path relative to BASE_DIR if it's not absolute
+    if not os.path.isabs(dataset_path_config):
+        # Search upwards for the dataset
+        current_search_dir = BASE_DIR
+        found = False
+        # Look up to 2 levels up (current, parent, grandparent)
+        for _ in range(3):
+            possible_path = os.path.join(current_search_dir, dataset_path_config)
+            if os.path.exists(possible_path):
+                dataset_name = possible_path
+                found = True
+                break
+            parent = os.path.dirname(current_search_dir)
+            if parent == current_search_dir: # Reached root
+                break
+            current_search_dir = parent
+        
+        if not found:
+            # Fallback to default behavior (relative to CWD or BASE_DIR directly)
+            dataset_name = os.path.join(BASE_DIR, dataset_path_config)
+            print(f"Warning: Dataset path '{dataset_path_config}' not found in parent directories. Using: {dataset_name}")
+    else:
+        dataset_name = dataset_path_config
+
+    # Transforms
+    cpu_transform = v2.Compose([
+        v2.ToImage(),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Grayscale(num_output_channels=1),
+    ])
+
+    # Read transform intensity from config, default to 1.0
+    transform_intensity = config.get('transform_intensity', 1.0)
+
+    # Build transform list conditionally
+    gpu_transform_train_list = [
+        v2.Resize((IMG_SIZE[0], IMG_SIZE[1]), antialias=True)
+    ]
+
+    gpu_transform_val = v2.Compose([
+        v2.Resize((IMG_SIZE[0], IMG_SIZE[1]), antialias=True)
+    ])
+
+    if transform_intensity > 0:
+        base_rotation = 1
+        base_translate = 0.03
+        base_scale_range = 0.03
+        base_jitter = 0.4
+        base_perspective_scale = 0.2
+        base_perspective_p = 0.3
+        base_sharpness_factor = 2.0
+        base_sharpness_p = 0.5
+        
+        gpu_transform_train_list.extend([
+            v2.RandomRotation(degrees=base_rotation * transform_intensity),
+            v2.RandomAffine(
+                degrees=0, 
+                translate=(base_translate * transform_intensity, base_translate * transform_intensity),
+                scale=(1.0 - base_scale_range * transform_intensity, 1.0 + base_scale_range * transform_intensity), 
+                shear=None
+            ),
+            v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]),
+            v2.ColorJitter(brightness=base_jitter * transform_intensity, contrast=base_jitter * transform_intensity),
+            v2.RandomPerspective(distortion_scale=min(1.0, base_perspective_scale * transform_intensity), p=min(1.0, base_perspective_p * transform_intensity)),
+            v2.RandomAdjustSharpness(sharpness_factor=1.0 + (base_sharpness_factor - 1.0) * transform_intensity, p=min(1.0, base_sharpness_p * transform_intensity)),
+        ])
+    else:
+        gpu_transform_train_list.append(v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]))
+
+    gpu_transform = v2.Compose(gpu_transform_train_list)
+
+    # Initialize detector positions
+    detector_pos_init_config = config.get('detector_pos', None)
+    detector_pos_xy = []
+
+    if detector_pos_init_config is not None:
+        for x, y in detector_pos_init_config:
+            detector_pos_xy.append((x, y))
+    else:
+        detector_pos_init = [
+            (803, 843, 273, 313),
+            (941, 981, 463, 503),
+            (941, 981, 697, 737),
+            (580, 620, 960, 1000),
+            (219, 259, 697, 737),
+        ]
+        for x0, x1, y0, y1 in detector_pos_init:
+            detector_pos_xy.append(((x0+x1)/2, (y0+y1)/2))
+            
     try:
         # Use Standard ImageFolder or InMemoryImageFolder based on config
         use_in_memory = config.get('in_memory_dataset', True) # Enabled by default for faster I/O
@@ -1208,52 +1413,30 @@ if __name__ == "__main__":
             # Run Evaluation if configured
             if config.get("run_evaluate_after_train", True):
                 print("\n--- Running Evaluation ---")
-                # Run as a subprocess to avoid context/memory issues and ensure it works cross-platform
-                import subprocess
-                
-                # Determine capture mode based on debug flag
-                debug_eval = config.get("debug_eval_subprocess", False)
-                
+                # Import evaluate directly to share memory (like InMemoryImageFolder)
                 try:
+                    import evaluate as eval_module
+                    
+                    debug_eval = config.get("debug_eval_subprocess", False)
                     if debug_eval:
-                        log_msg = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluate.py...\n"
-                        # Print to terminal, which will be caught by LoggerWriter and written to debug.log
-                        print(log_msg.strip())
-                        
-                        result = subprocess.run(
-                            [sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], 
-                            check=False,
-                            capture_output=True,
-                            text=True
-                        )
-                        
-                        # Print captured output so LoggerWriter can write it to debug.log
-                        print(f"Return code: {result.returncode}")
-                        print(f"STDOUT:\n{result.stdout}")
-                        print(f"STDERR:\n{result.stderr}")
-                        print("-" * 50)
-                            
-                        if result.returncode != 0:
-                            print(f"Evaluation script failed with code {result.returncode}. See {debug_log_path} for details.")
+                        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluation inline...")
+                        # Pass the already loaded val_dataset to save RAM and time
+                        eval_module.evaluate(custom_val_dataset=val_dataset)
                     else:
-                        # Silent mode: redirect subprocess output directly to debug.log
-                        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluate.py (silent mode)...")
+                        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluation inline (silent mode)...")
+                        # Temporarily redirect stdout to log file
                         with open(debug_log_path, 'a', encoding='utf-8') as f_log:
+                            original_stdout = sys.stdout
+                            sys.stdout = f_log
                             try:
-                                result = subprocess.run(
-                                    [sys.executable, os.path.join(BASE_DIR, 'evaluate.py')], 
-                                    check=True,
-                                    stdout=f_log,
-                                    stderr=subprocess.STDOUT
-                                )
-                                print("Evaluation completed successfully.")
-                            except subprocess.CalledProcessError as e:
-                                print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Evaluation failed with code {e.returncode}")
-                                raise e
-                except subprocess.CalledProcessError as e:
-                    print(f"Evaluation script failed: {e}")
+                                eval_module.evaluate(custom_val_dataset=val_dataset)
+                            finally:
+                                sys.stdout = original_stdout
+                        print("Evaluation completed successfully.")
                 except Exception as e:
-                    print(f"Evaluation script failed to start: {e}")
+                    print(f"Evaluation failed: {e}")
+                    import traceback
+                    traceback.print_exc()
                 
             # Archive Results
             print("\n--- Archiving Results ---")
@@ -1310,3 +1493,6 @@ if __name__ == "__main__":
         traceback.print_exc()
         if 'is_ddp' in locals() and is_ddp and dist.is_initialized():
             dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()

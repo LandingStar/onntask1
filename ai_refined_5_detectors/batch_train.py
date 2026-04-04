@@ -111,17 +111,24 @@ def run_one(cfg_file, shared_params, batch_opts, idx, total):
                 f"--master_port={master_port}",
                 TRAIN_SCRIPT, tmp_config, "--is-subprocess"
             ]
+            print(f"  [{idx}/{total}] Launching: {' '.join(cmd)}")
+            proc = subprocess.run(cmd, cwd=BASE_DIR)
+            returncode = proc.returncode
         else:
-            cmd = [sys.executable, TRAIN_SCRIPT, tmp_config, "--is-subprocess"]
-            
-        print(f"  [{idx}/{total}] Launching: {' '.join(cmd)}")
-        
-        proc = subprocess.run(
-            cmd,
-            cwd=BASE_DIR,
-        )
+            # Instead of spawning a subprocess, run inline to share RAM cache
+            print(f"  [{idx}/{total}] Running inline: {tmp_config}")
+            import train as train_module
+            # Set sys.argv so train.py parses the right config
+            sys.argv = [TRAIN_SCRIPT, tmp_config]
+            try:
+                train_module.main()
+                returncode = 0
+            except Exception as e:
+                print(f"  [{idx}/{total}] ERROR running inline: {e}")
+                returncode = 1
+                
         elapsed = time.time() - start_time
-        status = 'OK' if proc.returncode == 0 else f'FAIL (code {proc.returncode})'
+        status = 'OK' if returncode == 0 else f'FAIL (code {returncode})'
         print(f"  [{idx}/{total}] Finished: {status} in {elapsed:.1f}s")
         return (cfg_file, status, f'{elapsed:.1f}s')
     except Exception as e:
