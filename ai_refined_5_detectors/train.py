@@ -764,7 +764,10 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             labels = labels.to(device, non_blocking=True)
             
             with torch.no_grad():
-                images_aug = gpu_transform(images)
+                if gpu_transform:
+                    images_aug = gpu_transform(images)
+                else:
+                    images_aug = images
             
             if images_aug.shape[1] == 1:
                 images_squeezed = images_aug.squeeze(1)
@@ -775,13 +778,13 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             # PADDINGx is (1200-1000)//2 = 100.
             # gpu_transform adds 100 padding.
             # If input is 1000, output is 1200.
-                # Apply padding (can also be done async if using appropriate padding module)
-                if images_squeezed.shape[-1] == PhaseMask[0]:
-                     images_input = images_squeezed
-                else:
-                     images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
-                
-                out_label, out_img, penalty_per_det = model(images_input)
+            # Apply padding (can also be done async if using appropriate padding module)
+            if images_squeezed.shape[-1] == PhaseMask[0]:
+                 images_input = images_squeezed
+            else:
+                 images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
+            
+            out_label, out_img, penalty_per_det = model(images_input)
             
             loss = compute_loss(images_input, labels, out_img, out_label, current_epoch_spatial_weight, is_aggressive)
             # Only penalize target detectors (not all detectors)
@@ -842,6 +845,10 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 labels = labels.to(device, non_blocking=True)
                 
                 # Apply validation transforms on GPU (Resize)
+                if gpu_transform_val:
+                    images_aug = gpu_transform_val(images)
+                else:
+                    images_aug = images
                 
                 if images_aug.shape[1] == 1:
                     images_squeezed = images_aug.squeeze(1)
@@ -1313,7 +1320,9 @@ def main():
             num_workers=train_num_workers, 
             pin_memory=True,
             prefetch_factor=train_prefetch,
-            persistent_workers=True if train_num_workers > 0 else False,
+            # Disable persistent_workers when using InMemoryImageFolder in inline batch_trains
+            # because the shared memory file descriptors break across runs and cause ConnectionResetError
+            persistent_workers=False,
             drop_last=True # Helps with memory alignment and batch processing
         )
         val_dataloader = DataLoader(
@@ -1324,7 +1333,7 @@ def main():
             num_workers=val_num_workers, 
             pin_memory=True,
             prefetch_factor=val_prefetch,
-            persistent_workers=True if val_num_workers > 0 else False,
+            persistent_workers=False,
             drop_last=False
         )
         
