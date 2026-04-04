@@ -20,4 +20,6 @@ tmp*
 */backup_original_task2_.zip
 temp*
 temp_backup_task2/
-task1\ai_refined_5_detectors\detector_layout_vis.png
+ai_refined_5_detectors\detector_layout_vis.png
+main/*.png
+history_version/
