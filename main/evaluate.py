@@ -434,7 +434,7 @@ def evaluate(custom_val_dataset=None):
             _, preds = torch.max(out_label, 1)
             
             all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.numpy())
+            all_labels.extend(labels.cpu().numpy())
             
     # Confusion Matrix:
     # Rows: True Labels (0-19)

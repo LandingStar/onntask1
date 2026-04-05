@@ -371,13 +371,24 @@ def detector_region(Int, detector_mask=None, detector_minus=None, detector_pos=N
 
 # DNN Model
 class DNN(torch.nn.Module):
-    def __init__(self, num_layers=config.get('num_layers', 1), wl=wl, PhaseMask=PhaseMask, pixel_size=PIXEL_SIZE,
-                 distance_between_layers=config.get('distance_between_layers', 0.2), distance_to_detectors=config.get('distance_to_detectors', 0.2), 
-                 num_classes=config.get('num_classes', 5), train_detector_pos=config.get('train_detector_pos', True)):
+    def __init__(self, num_layers=None, wl_param=None, PhaseMask_param=None, pixel_size_param=None,
+                 distance_between_layers=None, distance_to_detectors=None, 
+                 num_classes=None, train_detector_pos=None):
         super(DNN, self).__init__()
         
+        # Dynamically fetch from global scope/config if not explicitly provided
+        # This prevents issues during inline batch execution where defaults are bound at module import time
+        num_layers = num_layers if num_layers is not None else config.get('num_layers', 1)
+        wl_param = wl_param if wl_param is not None else wl
+        PhaseMask_param = PhaseMask_param if PhaseMask_param is not None else PhaseMask
+        pixel_size_param = pixel_size_param if pixel_size_param is not None else PIXEL_SIZE
+        distance_between_layers = distance_between_layers if distance_between_layers is not None else config.get('distance_between_layers', 0.2)
+        distance_to_detectors = distance_to_detectors if distance_to_detectors is not None else config.get('distance_to_detectors', 0.2)
+        num_classes = num_classes if num_classes is not None else config.get('num_classes', 5)
+        train_detector_pos = train_detector_pos if train_detector_pos is not None else config.get('train_detector_pos', True)
+        
         self.phase_mask = torch.nn.ParameterList([
-            torch.nn.Parameter(torch.rand(PhaseMask, dtype=torch.float32)) for _ in range(num_layers)
+            torch.nn.Parameter(torch.rand(PhaseMask_param, dtype=torch.float32)) for _ in range(num_layers)
         ])
         
         self.detector_mask = torch.nn.Parameter(torch.ones(num_classes))
@@ -413,8 +424,8 @@ class DNN(torch.nn.Module):
         else:
             print("Detector bias training ENABLED")
         
-        self.diffractive_layers = torch.nn.ModuleList([Diffractive_Layer(wl, PhaseMask, pixel_size, distance_between_layers) for _ in range(num_layers)])
-        self.last_diffractive_layer = Propagation_Layer(wl, PhaseMask, pixel_size, distance_to_detectors)
+        self.diffractive_layers = torch.nn.ModuleList([Diffractive_Layer(wl_param, PhaseMask_param, pixel_size_param, distance_between_layers) for _ in range(num_layers)])
+        self.last_diffractive_layer = Propagation_Layer(wl_param, PhaseMask_param, pixel_size_param, distance_to_detectors)
 
         # Misalignment Layer Simulation
         self.simulate_misalignment = config.get('simulate_misalignment', False)
@@ -427,11 +438,11 @@ class DNN(torch.nn.Module):
         if self.simulate_misalignment and self.misalignment_tilt_max > 0:
             # Physical coordinates (x, y) based on pixel size
             # Center is at (0, 0)
-            x_range = (torch.arange(PhaseMask[1], dtype=torch.float32, device=device) - PhaseMask[1] / 2) * pixel_size
-            y_range = (torch.arange(PhaseMask[0], dtype=torch.float32, device=device) - PhaseMask[0] / 2) * pixel_size
+            x_range = (torch.arange(PhaseMask_param[1], dtype=torch.float32, device=device) - PhaseMask_param[1] / 2) * pixel_size_param
+            y_range = (torch.arange(PhaseMask_param[0], dtype=torch.float32, device=device) - PhaseMask_param[0] / 2) * pixel_size_param
             self.yy, self.xx = torch.meshgrid(y_range, x_range, indexing='ij')
             # Wavenumber k = 2pi / lambda
-            self.k = 2 * np.pi / wl
+            self.k = 2 * np.pi / wl_param
 
     def apply_misalignment(self, E):
         if not self.training or not self.simulate_misalignment:
