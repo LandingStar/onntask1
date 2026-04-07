@@ -5,8 +5,6 @@ torchvision>=0.16.0
 # Scientific & Data Processing
 numpy
 pandas
-scipy
-sympy
 
 # Image Processing
 Pillow
@@ -16,11 +14,4 @@ matplotlib
 
 # Utilities
 tqdm
-PyYAML
-
-# PDF / Document Processing (used in project)
-PyMuPDF
-pypdf
-
-# Profiling / Performance (used in project)
-nsight-python
+psutil
