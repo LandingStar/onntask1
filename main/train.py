@@ -365,9 +365,25 @@ def detector_region(Int, detector_mask=None, detector_minus=None, detector_pos=N
         else:
             detectors_list[:, i] = raw_val
 
-    total = detectors_list.sum(dim=1, keepdim=True) + 1e-8
-        
-    return Int, detectors_list / total, penalty_per_det
+    # Always use relative distribution for classification (MSE) stability
+    total_det_energy = detectors_list.sum(dim=1, keepdim=True) + 1e-8
+    
+    # Calculate the true global energy of the entire PhaseMask plane
+    global_energy = Int.sum(dim=(1, 2), keepdim=True) + 1e-8
+    
+    # We return BOTH the relative output (for classification) and the global ratio (for energy loss/logging)
+    # But since the signature expects Int, output, penalty, we can append it or pass it as part of penalty.
+    # A cleaner way is to return global_energy and calculate it in compute_loss, 
+    # but to not break the signature `out_label, out_img, penalty = model(x)`, 
+    # we can just pass global_energy as a 4th return value, but that breaks all `out_label, out_img, _ = model(...)`
+    # Alternatively, we just return the raw `detectors_list` instead of normalized, or calculate global sum inside compute_loss.
+    
+    # Let's revert `detector_region` to its exact original signature and behavior for `detectors_list / total`.
+    # We will compute the global energy inside `compute_loss` by passing `Int` (out_img) directly!
+    # Wait, instead of calculating global energy inside `compute_loss` and re-integrating, 
+    # we can append the raw `detectors_list` to the penalty tensor, or return it as a 4th output.
+    # To keep it simple and strictly non-breaking, we just return the original tuple.
+    return Int, detectors_list / total_det_energy, penalty_per_det, detectors_list
 
 # DNN Model
 class DNN(torch.nn.Module):
@@ -536,8 +552,8 @@ class DNN(torch.nn.Module):
             E = temp * modulation
         E = self.last_diffractive_layer(E)
         Int = torch.abs(E)**2
-        Int, output, edge_loss = detector_region(Int, self.detector_mask, self.detector_minus, current_detector_pos)
-        return output, Int, edge_loss
+        Int, output, edge_loss, raw_detectors_list = detector_region(Int, self.detector_mask, self.detector_minus, current_detector_pos)
+        return output, Int, edge_loss, raw_detectors_list
 
 def plot_loss_acc(train_loss, val_loss, train_acc, val_acc, save_path):
     plt.figure(figsize=(12, 5))
@@ -682,7 +698,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         
     start_time = time.time()
 
-    def compute_loss(images, labels, out_img, output_vec, current_spatial_weight, is_aggressive=False):
+    def compute_loss(images, labels, out_img, output_vec, raw_detectors, current_spatial_weight, is_aggressive=False):
         det_shape = config.get('detector_shape', 'circle')
         det_size_config = config.get('detector_size', 60)
         
@@ -737,10 +753,24 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         loss_vec = F.mse_loss(output_vec, target_mask_weight, reduction='none').mean(dim=1)
         
         # 2. Target Energy Penalty (Batch-wise)
-        current_target_intensity_ratio = (output_vec * target_mask_weight).sum(dim=1) * area_ratio
+        # Calculate the absolute total energy in the entire PhaseMask
+        global_energy = out_img.sum(dim=(1, 2)) + 1e-8
         
+        # Calculate the absolute energy of the target detector
+        # target_mask_weight is [batch_size, num_classes], indicating which detector(s) are the target
+        target_det_energy = (raw_detectors * target_mask_weight).sum(dim=1)
+        
+        # Toggle between relative distribution (old behavior) and true global energy concentration
+        use_global_energy = config.get('use_global_energy_ratio', True)
+        
+        if use_global_energy:
+            # True global physical concentration ratio
+            current_target_intensity_ratio = (target_det_energy / global_energy) * area_ratio
+        else:
+            # Relative distribution ratio (old behavior)
+            current_target_intensity_ratio = (output_vec * target_mask_weight).sum(dim=1) * area_ratio
+            
         if is_aggressive:
-            # Switch to LeakyReLU (or softplus) to keep pushing intensity even after target_ratio is met.
             # Normal ReLU clips negative values to 0 (meaning zero loss/gradient once target is met).
             # LeakyReLU with slope 0.1 provides continuous gradient to keep improving intensity indefinitely.
             aggressive_slope = config.get('aggressive_leaky_slope', 0.1)
@@ -833,9 +863,9 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             else:
                  images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
             
-            out_label, out_img, penalty_per_det = model(images_input)
+            out_label, out_img, penalty_per_det, raw_detectors = model(images_input)
             
-            loss = compute_loss(images_input, labels, out_img, out_label, current_epoch_spatial_weight, is_aggressive)
+            loss = compute_loss(images_input, labels, out_img, out_label, raw_detectors, current_epoch_spatial_weight, is_aggressive)
             # Only penalize target detectors (not all detectors)
             target_det = labels // 4
             target_penalty = penalty_per_det[torch.arange(len(labels), device=device), target_det]
@@ -909,9 +939,9 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 else:
                     images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
                     
-                out_label, out_img, penalty_per_det = model(images_input)
+                out_label, out_img, penalty_per_det, raw_detectors = model(images_input)
                 
-                loss = compute_loss(images_input, labels, out_img, out_label, current_epoch_spatial_weight, is_aggressive)
+                loss = compute_loss(images_input, labels, out_img, out_label, raw_detectors, current_epoch_spatial_weight, is_aggressive)
                 target_det = labels // 4
                 target_penalty = penalty_per_det[torch.arange(len(labels), device=device), target_det]
                 loss += target_penalty.sum()
@@ -921,12 +951,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 total += labels.size(0)
                 
                 # Calculate target detector AVERAGE intensity ratio for this batch
-                # out_label is the ratio of integral sum.
-                # To get average intensity: (Detector_Sum / Detector_Area) / (Global_Sum / Global_Area)
-                # Since out_label = Detector_Sum / Global_Sum
-                # Avg_Intensity_Ratio = out_label * (Global_Area / Detector_Area)
-                target_intensities = out_label[torch.arange(len(labels), device=device), target_det]
-                
                 det_shape = config.get('detector_shape', 'circle')
                 det_size_config = config.get('detector_size', 60)
                 if det_shape == 'square':
@@ -937,7 +961,15 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 global_area = PhaseMask[0] * PhaseMask[1]
                 area_ratio = global_area / det_area
                 
-                target_avg_intensity_ratio = target_intensities * area_ratio
+                use_global_energy = config.get('use_global_energy_ratio', False)
+                if use_global_energy:
+                    global_energy = out_img.sum(dim=(1, 2)) + 1e-8
+                    target_det_energy = raw_detectors[torch.arange(len(labels), device=device), target_det]
+                    target_avg_intensity_ratio = (target_det_energy / global_energy) * area_ratio
+                else:
+                    target_intensities = out_label[torch.arange(len(labels), device=device), target_det]
+                    target_avg_intensity_ratio = target_intensities * area_ratio
+                    
                 val_target_intensity_sum += target_avg_intensity_ratio.sum().item()
 
         if dist.is_initialized():
