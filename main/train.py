@@ -450,6 +450,13 @@ class DNN(torch.nn.Module):
             
         batch_size = E.shape[0]
         
+        # Handle shape differences: E could be [B, H, W] or [B, C, H, W]
+        has_channel_dim = len(E.shape) == 4
+        if has_channel_dim:
+            h_idx, w_idx = 2, 3
+        else:
+            h_idx, w_idx = 1, 2
+        
         # 1. Random translation (shift in x and y)
         shift_x = (torch.rand(batch_size, device=device) * 2 - 1) * self.misalignment_translation_max
         shift_y = (torch.rand(batch_size, device=device) * 2 - 1) * self.misalignment_translation_max
@@ -460,8 +467,8 @@ class DNN(torch.nn.Module):
         sin_a = torch.sin(angle_rad)
         
         # Normalized translation for grid_sample (-1 to 1)
-        tx = shift_x / (E.shape[3] / 2)
-        ty = shift_y / (E.shape[2] / 2)
+        tx = shift_x / (E.shape[w_idx] / 2)
+        ty = shift_y / (E.shape[h_idx] / 2)
         
         affine_matrix = torch.zeros(batch_size, 2, 3, device=device)
         affine_matrix[:, 0, 0] = cos_a
@@ -472,14 +479,21 @@ class DNN(torch.nn.Module):
         affine_matrix[:, 1, 2] = ty
         
         # Grid sample requires real tensors (Channels=2 for complex)
-        E_real = E.real.unsqueeze(1) # [B, 1, H, W]
-        E_imag = E.imag.unsqueeze(1)
+        # We need to temporarily unsqueeze the channel dimension if it doesn't exist
+        E_working = E if has_channel_dim else E.unsqueeze(1)
+        
+        E_real = E_working.real # [B, 1, H, W]
+        E_imag = E_working.imag
         E_concat = torch.cat([E_real, E_imag], dim=1) # [B, 2, H, W]
         
         grid = F.affine_grid(affine_matrix, E_concat.size(), align_corners=False)
         E_warped = F.grid_sample(E_concat, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
         
-        E_out = torch.complex(E_warped[:, 0], E_warped[:, 1])
+        E_out = torch.complex(E_warped[:, 0:1], E_warped[:, 1:2]) # Keep the channel dim [B, 1, H, W]
+        
+        # Remove channel dim if it wasn't there originally
+        if not has_channel_dim:
+            E_out = E_out.squeeze(1)
         
         # 3. Out-of-plane tilt (around X and Y axis -> Phase gradient)
         if self.misalignment_tilt_max > 0:
@@ -490,8 +504,12 @@ class DNN(torch.nn.Module):
             # Phase gradient = k * (x * sin(tilt_y) + y * sin(tilt_x))
             # For small angles, sin(theta) ≈ theta
             phase_gradient = self.k * (self.xx.unsqueeze(0) * tilt_y + self.yy.unsqueeze(0) * tilt_x)
-            tilt_phasor = torch.exp(1j * phase_gradient)
             
+            # Add channel dimension to phasor if E_out has it
+            if has_channel_dim:
+                phase_gradient = phase_gradient.unsqueeze(1)
+                
+            tilt_phasor = torch.exp(1j * phase_gradient)
             E_out = E_out * tilt_phasor
             
         return E_out
@@ -605,7 +623,27 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     
     if config.get('inherit_best_model', False):
         import glob
-        model_paths = glob.glob(os.path.join(results_dir, "*", "best_model.pth"))
+        inherit_model_path = config.get('inherit_model_path', "")
+        
+        # 决定匹配的名称：如果有设置则用设置的，否则用当前的 exp_name
+        target_name = inherit_model_path if inherit_model_path else exp_name
+        
+        # 尝试精确匹配前缀
+        search_pattern = os.path.join(results_dir, f"{target_name}_*", "best_model.pth")
+        model_paths = glob.glob(search_pattern)
+        
+        # 尝试更宽松的匹配
+        if not model_paths:
+            model_paths = glob.glob(os.path.join(results_dir, f"*{target_name}*", "best_model.pth"))
+            
+        # 如果依然没找到，回退到匹配所有最新的模型，并打印警告
+        if not model_paths:
+            fallback_paths = glob.glob(os.path.join(results_dir, "*", "best_model.pth"))
+            if fallback_paths:
+                if is_main_process:
+                    print(f"WARNING: Could not find previous model for '{target_name}'. Falling back to the absolute newest model in results_dir.")
+                model_paths = fallback_paths
+            
         if model_paths:
             # Sort by modification time, newest first
             model_paths.sort(key=os.path.getmtime, reverse=True)

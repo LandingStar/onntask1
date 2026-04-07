@@ -24,6 +24,8 @@
     "misalignment_rotation_max_degrees": 0.5,
     "misalignment_tilt_max_degrees": 0.1,
     "in_memory_dataset": true,
+    "inherit_best_model": false,
+    "inherit_model_path": "",
     "master_port": 29500,
     "dataset_path": "./continue5"
 

@@ -1,0 +1,84 @@
+{
+    "batch_size": 256,
+    "epochs": 150,
+    "learning_rate": 0.001,
+    "label_num": 20,
+    "run_evaluate_after_train": true,
+    "debug_eval_subprocess": true,
+    "transform_intensity": 0.2,
+    "scheduler_patience": 10,
+    "scheduler_metric": "acc",
+    "spatial_mask_loss_weight": 1600.0,
+    "aggressive_leaky_slope": 0.1,
+    "auto_spatial_mask_target_ratio": 50.0,
+    "best_model_acc_weight": 1.0,
+    "best_model_intensity_weight": 0.5,
+    "simulate_misalignment": true,
+    "misalignment_translation_max_pixels": 2.0,
+    "misalignment_rotation_max_degrees": 0.5,
+    "misalignment_tilt_max_degrees": 0.1,
+    "in_memory_dataset": true,
+    "img_size": [
+        1000,
+        1000
+    ],
+    "phase_mask_size": [
+        1200,
+        1200
+    ],
+    "pixel_size": 8e-06,
+    "wavelength": 5.32e-07,
+    "distance_between_layers": 0.15,
+    "distance_to_detectors": 0.2,
+    "num_layers": 1,
+    "num_classes": 5,
+    "strict_accuracy_ratio": 0,
+    "minus_mask_ratio": 0,
+    "dataset_path": "./continue5",
+    "train_detector_pos": false,
+    "train_detector_scale": false,
+    "train_detector_bias": false,
+    "detector_shape": "square",
+    "detector_size": 120,
+    "position_jitter": 0.2,
+    "edge_penalty_weight": 0.0,
+    "edge_width_ratio": 0.1,
+    "concentration_loss_weight": 0.001,
+    "detector_loss_weight": [
+        0.7,
+        1.07,
+        1.25,
+        1.07,
+        0.9
+    ],
+    "soft_label_enabled": false,
+    "soft_label_offset": 0.25,
+    "soft_label_temperature": 0.5,
+    "exp_name": "floating_5det_one",
+    "save_csv_logs": false,
+    "inherit_best_model": false,
+    "results_dir": "results",
+    "detector_pos": [
+        [
+            600.0,
+            260.0
+        ],
+        [
+            961.0,
+            600.0
+        ],
+        [
+            961.0,
+            940.0
+        ],
+        [
+            600.0,
+            940.0
+        ],
+        [
+            239.0,
+            600.0
+        ]
+    ],
+    "batch_train": false
+}

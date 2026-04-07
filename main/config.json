@@ -66,6 +66,7 @@
     "exp_name": "floating_5det_one",
     "save_csv_logs": false,
     "inherit_best_model": false,
+    "inherit_model_path": "",
     "results_dir": "results",
     "detector_pos": [
         [

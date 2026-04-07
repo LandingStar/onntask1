@@ -70,5 +70,6 @@ When using `batch_train.py`, you can enable multi-GPU training by adding these k
 ## Miscellaneous
 - **`transform_intensity`**: Scales the magnitude of data augmentations (rotation, jitter, etc.). Set to `0` to disable all augmentations except padding/resizing.
 - **`inherit_best_model`**: If true, automatically loads the weights from the latest `best_model.pth` found in `results_dir` before starting.
+- **`inherit_model_path`**: (Optional) If `inherit_best_model` is true, this string determines which experiment's model to inherit. It matches experiment folders containing this string (ignoring dates). If left empty (`""`), it defaults to matching the current `exp_name`. If no matching model is found, it falls back to inheriting the absolute newest model across all experiments (and prints a warning).
 - **`save_csv_logs`**: If true, saves the Phase Mask and Detector Positions as CSV files.
 - **`save_csv_logs_every_epoch`**: If true, saves CSVs every epoch (WARNING: Very slow). If false, only saves at the last epoch.

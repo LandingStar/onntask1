@@ -1,0 +1,89 @@
+{
+    "batch_size": 384,
+    "epochs": 80,
+    "learning_rate": 0.001,
+    "label_num": 20,
+    "run_evaluate_after_train": true,
+    "debug_eval_subprocess": true,
+    "transform_intensity": 0.2,
+    "scheduler_patience": 10,
+    "scheduler_metric": "acc",
+    "spatial_mask_loss_weight": 2500.0,
+    "auto_spatial_mask_target_ratio": 50.0,
+    "best_model_acc_weight": 1.0,
+    "best_model_intensity_weight": 0.5,
+    "img_size": [
+        1000,
+        1000
+    ],
+    "phase_mask_size": [
+        1200,
+        1200
+    ],
+    "pixel_size": 8e-06,
+    "wavelength": 5.32e-07,
+    "distance_between_layers": 0.15,
+    "distance_to_detectors": 0.2,
+    "num_layers": 2,
+    "num_classes": 5,
+    "strict_accuracy_ratio": 0,
+    "minus_mask_ratio": 0,
+    "scheduler_factor": 0.5,
+    "scheduler_min_lr": 1e-06,
+    "dataset_path": "./continue5",
+    "train_detector_pos": false,
+    "train_detector_scale": false,
+    "train_detector_bias": false,
+    "detector_shape": "square",
+    "detector_size": 120,
+    "position_jitter": 0.2,
+    "edge_penalty_weight": 0.0,
+    "edge_width_ratio": 0.1,
+    "concentration_loss_weight": 0.001,
+    "detector_loss_weight": [
+        0.85,
+        0.9,
+        1,
+        0.9,
+        0.85
+    ],
+    "use_blur_background_loss": true,
+    "blur_kernel_size": 21,
+    "blur_sigma": 5.0,
+    "blur_background_loss_weight": 20.0,
+    "use_spatial_mask_loss": true,
+    "spatial_mask_sigma": 15.0,
+    "use_intensity_ratio_loss": true,
+    "intensity_ratio_loss_weight": 0.1,
+    "soft_label_enabled": false,
+    "soft_label_offset": 0.25,
+    "soft_label_temperature": 0.5,
+    "phase_noise_relative": 0.05,
+    "exp_name": "floating_5det_two_layer",
+    "save_csv_logs": false,
+    "inherit_best_model": false,
+    "results_dir": "results",
+    "detector_pos": [
+        [
+            600.0,
+            260.0
+        ],
+        [
+            961.0,
+            600.0
+        ],
+        [
+            961.0,
+            940.0
+        ],
+        [
+            600.0,
+            940.0
+        ],
+        [
+            239.0,
+            600.0
+        ]
+    ],
+    "batch_train": false
+}
