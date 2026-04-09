@@ -140,7 +140,7 @@ with torch.no_grad():
         if imgs.shape[1] == 1:
             imgs = imgs.squeeze(1)
         inp = F.pad(imgs, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
-        out, _, _ = model(inp)
+        out, _, _, _ = model(inp)
         _, preds = torch.max(out, 1)
         preds = preds.cpu()
         for l in range(label_num):

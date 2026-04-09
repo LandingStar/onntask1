@@ -301,7 +301,7 @@ def evaluate(custom_val_dataset=None):
         images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
     
     with torch.no_grad():
-        out_label, out_img, _ = model(images_input)
+        out_label, out_img, _, _ = model(images_input)
         
     fig, axes = plt.subplots(num_samples, 4, figsize=(20, 5*num_samples), squeeze=False)
     
@@ -430,7 +430,7 @@ def evaluate(custom_val_dataset=None):
             else:
                 images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
             
-            out_label, _, _ = model(images_input)
+            out_label, _, _, _ = model(images_input)
             _, preds = torch.max(out_label, 1)
             
             all_preds.extend(preds.cpu().numpy())
