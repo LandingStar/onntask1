@@ -1,5 +1,13 @@
 # ONN Configuration Guide (`config.json`)
 
+## Reproducibility Notes
+- The `config.json` copied into each `results/<run>/` directory is the source of truth for what actually ran. Do not assume a file under `test/` or `batch_config/` still matches the launched run if it was edited later.
+- If `inherit_best_model = true`, the trainer first searches `results_dir` for `best_model.pth` matching `inherit_model_path` (or `exp_name` if the path is empty). If nothing matches, it falls back to the absolute newest `best_model.pth` in `results_dir`.
+- `best_model_metric`, `scheduler_metric`, and `score_intensity_source` together decide which checkpoint is saved to `best_model.pth` and which signal drives LR scheduling. Always verify these three fields in the saved run config before interpreting results.
+- In the compact epoch log line, `Int.Ratio` shows the ratio selected by `score_intensity_source`. For detailed interpretation of physical metrics, prefer `metrics.csv` columns such as `avg_global_concentration_ratio`, `avg_outside_average_ratio`, and `avg_physical_focus_ratio`.
+- For newer physical-objective experiments, verify the actual saved `metrics.csv` header in the run directory before assuming a metric is available. A metric may exist in the current code but still be absent from an older or mismatched run artifact.
+- If saved run artifacts contradict the current on-disk `train.py` behavior, assume the run was launched from a different code snapshot until that mismatch is explained. Treat the run directory as the source of truth and re-check the exact launcher / file provenance before drawing conclusions from code.
+
 This document explains all available configuration parameters used in `train.py`. You can copy `config.example.json` to `config.json` or `batch_config/your_config.json` and modify it.
 
 ## Basic Training
@@ -58,12 +66,35 @@ There are now two independent intensity-related terms:
 ### Detector Competition Loss
 - **`detector_competition_loss_weight`**: (float) Weight of the old helper loss.
 - **`detector_competition_target_ratio`**: (float) Target ratio for the detector competition helper loss.
+- **`detector_competition_loss_mode`**: (string) Controls the exact detector-helper semantics.
+  Recommended values are:
+  - `"raw_margin"`: Uses the signed margin `target_ratio - current_ratio`. Once the target is exceeded, this term becomes negative and keeps rewarding further detector-ratio growth.
+  - `"legacy_relu_helper"`: Restores the historical helper behavior. Before aggressive mode it uses ReLU and stops contributing once the target ratio is met; in aggressive mode it switches to LeakyReLU to keep pushing concentration.
+  Default is `"raw_margin"` to preserve the current experiment behavior.
 
 ### Global Energy Concentration Loss
 - **`global_energy_concentration_loss_weight`**: (float) Weight of the global concentration loss.
 - **`global_energy_concentration_target_ratio`**: (float) Target ratio for the global concentration loss.  
   This is the desired *Average Intensity Ratio* (Average Intensity inside Detector / Average Intensity of entire plane). E.g., `50.0` means the light inside the target detector should be on average 50 times brighter than the background.
+- **`global_physical_objective_mode`**: (string) Controls the exact physical objective used by the global term.
+  Recommended values are:
+  - `"global_ratio"`: The existing objective. Pushes the target detector's average intensity relative to the entire plane.
+  - `"target_inside_outside"`: A two-term physical objective. It rewards target-detector average intensity and penalizes the average intensity outside the target detector.
+  - `"target_attract_ring"`: A spatial objective for phase-2 tuning. It uses a continuous attraction kernel centered on the target detector and optionally penalizes the detector's outer ring region to suppress bright halos around detector edges.
+- **`global_inside_reward_weight`**: (float) Relative weight of the target-inside reward when `global_physical_objective_mode = "target_inside_outside"`.
+- **`global_outside_penalty_weight`**: (float) Relative weight of the outside-energy penalty when `global_physical_objective_mode = "target_inside_outside"`.
+- **`global_attract_reward_weight`**: (float) Relative weight of the continuous attraction term when `global_physical_objective_mode = "target_attract_ring"`.
+- **`global_outer_ring_penalty_weight`**: (float) Relative weight of the detector-outer-ring penalty when `global_physical_objective_mode = "target_attract_ring"`.
+- **`global_attract_sigma_ratio`**: (float) Attraction-kernel width relative to `detector_size`. Larger values create a wider spatial attraction basin.
+- **`global_attract_extent_ratio`**: (float) Extra support radius of the local attraction crop relative to `detector_size`.
+- **`global_outer_ring_width_ratio`**: (float) Width of the penalized outer ring relative to `detector_size`.
 - **`global_concentration_start_acc`**: (float) Validation-accuracy threshold that must be reached before the global concentration loss is enabled. This is intended to keep early training classification-first.
+- **`global_concentration_hold_epochs`**: (int) Optional sticky window for the global loss. Once the validation accuracy reaches `global_concentration_start_acc`, the global loss stays enabled for this many subsequent epochs even if accuracy dips slightly below the threshold. Default is `0` (no sticky window).
+
+### Stage-Transition Controls
+- **`detector_competition_decay_after_global`**: (boolean) If true, once validation accuracy first reaches `global_concentration_start_acc`, the detector competition helper weight starts decaying across later epochs.
+- **`detector_competition_decay_epochs`**: (int) Number of epochs used for the detector-helper decay schedule after global activation starts.
+- **`detector_competition_decay_floor_ratio`**: (float) Final ratio of the original detector helper weight after decay completes. For example, `0.25` means the helper decays down to 25% of its original weight and then stays there.
 
 ### Backward Compatibility
 - **`spatial_mask_loss_weight`** and **`auto_spatial_mask_target_ratio`** are still accepted as legacy fields.
@@ -85,8 +116,18 @@ There are now two independent intensity-related terms:
   The weight given to Validation Accuracy when calculating the `Composite Score` to determine the best model. Default is `1.0`.
 - **`best_model_intensity_weight`**: (float) **Intensity Importance in Model Selection.** 
   The weight given to the selected intensity ratio when calculating the `Composite Score` to determine the best model. Default is `0.5`.
-- **`score_intensity_source`**: (string) Which ratio to use in score/model selection. Options: `"detector_competition"` or `"global_concentration"`.
-- **`score_intensity_cap`**: (float) Caps the intensity contribution to `Composite Score` before aggressive optimization is triggered.
+- **`score_intensity_source`**: (string) Which ratio to use in score/model selection. Options: `"detector_competition"`, `"global_concentration"`, `"physical_focus"`, or `"spatial_focus"`.
+- **`score_intensity_cap`**: (float) Caps the intensity contribution to `Composite Score` before aggressive optimization is triggered when using the legacy hard-cap score path.
+- **`score_use_soft_intensity`**: (boolean) If `true`, replaces the hard cap with a soft `tanh` normalization before intensity enters `Composite Score`. Defaults to `true` for `score_intensity_source = "spatial_focus"`.
+- **`score_intensity_reference`**: (float) Reference scale for the soft-normalized score path. Larger values make the intensity contribution grow more slowly.
+- **`score_acc_gate`**: (float) Accuracy threshold for unlocking the intensity contribution in the soft-normalized score path.
+- **`score_acc_gate_width`**: (float) Transition width for the accuracy gate. With `score_acc_gate = 0.995` and `score_acc_gate_width = 0.005`, the intensity term ramps from suppressed to fully active between `0.995` and `1.000` validation accuracy.
+- **`score_outside_penalty_weight`**: (float) Only used when `score_intensity_source = "physical_focus"`. It sets how strongly outside average intensity reduces the selection score.
+- **`score_ring_penalty_weight`**: (float) Only used when `score_intensity_source = "spatial_focus"`. It sets how strongly target outer-ring intensity reduces the selection score.
+- Recommended note for `spatial_focus`:
+  - do not blindly reuse the old `global_ratio` cap logic
+  - prefer `score_use_soft_intensity = true`
+  - give it its own `score_intensity_reference`
 
 ## Misalignment Simulation (Physical Error Modeling)
 To simulate the physical manufacturing and assembly tolerances, you can inject random sub-pixel misalignment and tilt errors between layers.
@@ -102,7 +143,10 @@ When using `batch_train.py`, you can enable multi-GPU training by adding these k
 - **`master_port`**: (int) The base port for DDP communication. `batch_train.py` will automatically increment this port for each parallel task to avoid collisions. Default is `29500`.
 
 ## Miscellaneous
-- **`transform_intensity`**: Scales the magnitude of data augmentations (rotation, jitter, etc.). Set to `0` to disable all augmentations except padding/resizing.
+- **`transform_intensity`**: Legacy combined augmentation strength. If `physical_transform_intensity` and `visual_transform_intensity` are not explicitly set, both groups inherit this value for backward compatibility.
+- **`physical_transform_intensity`**: Strength of physically motivated input perturbations. This controls small input-plane rotation, translation, and the additive input noise used to mimic propagation/coupling fluctuations.
+- **`physical_input_noise_std`**: Base standard deviation of additive Gaussian noise for the input field. The effective noise is `physical_input_noise_std * physical_transform_intensity`.
+- **`visual_transform_intensity`**: Strength of generic image-style augmentations. This controls input scaling, brightness/contrast jitter, perspective warping, and sharpness perturbation.
 - **`inherit_best_model`**: If true, automatically loads the weights from the latest `best_model.pth` found in `results_dir` before starting.
 - **`inherit_model_path`**: (Optional) If `inherit_best_model` is true, this string determines which experiment's model to inherit. It matches experiment folders containing this string (ignoring dates). If left empty (`""`), it defaults to matching the current `exp_name`. If no matching model is found, it falls back to inheriting the absolute newest model across all experiments (and prints a warning).
 - **`save_csv_logs`**: If true, saves the Phase Mask and Detector Positions as CSV files.

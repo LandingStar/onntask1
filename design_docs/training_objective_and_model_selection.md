@@ -214,6 +214,9 @@ Observed sequence:
 6. deeper comparison with historical results showed the old detector competition path was likely helping classification itself
 7. switching the primary classification objective back toward detector competition immediately produced a much faster accuracy rise, including very high accuracy in the first epoch of the new test
 8. a later bug was found in the LR scheduler migration: `step()` used the new explicit metric semantics, but `ReduceLROnPlateau(mode=...)` was still initialized using the old `"acc"` naming assumption, so `scheduler_metric="val_acc"` incorrectly behaved like a `min` metric and the LR never decayed as intended
+9. another follow-up issue was found when reusing the old competition-style term as the primary classification objective: directly minimizing the old target-margin form made the primary loss strongly negative and poorly scaled; the fix was to use a scale-stable detector-ranking objective (`- target_share`) for the primary path while keeping the target-margin form only for auxiliary use
+10. another evaluation bug was found later: `evaluate.py` scanned the globally latest result subdirectory containing `best_model.pth` instead of being forced to use the current training run's `save_dir`, which could make a new experiment write evaluation artifacts using a different run's checkpoint
+11. a later cleanup removed the remaining directory-guessing logic in `main()`: `train()` now returns the exact `save_dir`, and evaluation/debug logging should always use that explicit path rather than scanning the filesystem for the latest matching folder
 
 Current interpretation:
 

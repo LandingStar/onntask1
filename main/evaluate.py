@@ -21,8 +21,8 @@ import torchvision.transforms.v2 as v2
 # 4. Local imports
 from train import DNN, cpu_transform
 
-def evaluate(custom_val_dataset=None):
-    # 1. Find the latest result directory first
+def evaluate(custom_val_dataset=None, result_dir_override=None):
+    # 1. Resolve target result directory first
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     
     # Temporarily load main config just to find results_dir base path
@@ -39,20 +39,23 @@ def evaluate(custom_val_dataset=None):
         results_dir = results_dir_config
         
     latest_subdir = None
-    if os.path.exists(results_dir):
-        import glob
-        # We look for all subdirectories containing best_model.pth
-        model_paths = glob.glob(os.path.join(results_dir, "**", "best_model.pth"), recursive=True)
-        if model_paths:
-            # Sort by modification time to find the latest
-            model_paths.sort(key=os.path.getmtime, reverse=True)
-            latest_subdir = os.path.dirname(model_paths[0])
-            
-    if not latest_subdir:
-        print(f"No valid result subdirectories (containing best_model.pth) found in {results_dir}.")
-        return
-
-    print(f"Latest result directory found: {latest_subdir}")
+    if result_dir_override is not None:
+        latest_subdir = result_dir_override
+        print(f"Using explicit result directory: {latest_subdir}")
+    else:
+        if os.path.exists(results_dir):
+            import glob
+            # We look for all subdirectories containing best_model.pth
+            model_paths = glob.glob(os.path.join(results_dir, "**", "best_model.pth"), recursive=True)
+            if model_paths:
+                # Sort by modification time to find the latest
+                model_paths.sort(key=os.path.getmtime, reverse=True)
+                latest_subdir = os.path.dirname(model_paths[0])
+                
+        if not latest_subdir:
+            print(f"No valid result subdirectories (containing best_model.pth) found in {results_dir}.")
+            return
+        print(f"Latest result directory found: {latest_subdir}")
 
     # 2. Load the config specific to THIS result directory
     result_config_path = os.path.join(latest_subdir, 'config.json')

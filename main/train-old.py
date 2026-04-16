@@ -22,96 +22,6 @@ from tqdm import tqdm
 import json
 import sys
 
-
-class AdditiveGaussianNoise(torch.nn.Module):
-    def __init__(self, std=0.0):
-        super().__init__()
-        self.std = float(std)
-
-    def forward(self, image):
-        if self.std <= 0.0:
-            return image
-        noisy = image + torch.randn_like(image) * self.std
-        return torch.clamp(noisy, 0.0, 1.0)
-
-
-def build_gpu_transforms(config, img_size, padding_x, padding_y):
-    legacy_transform_intensity = float(config.get('transform_intensity', 1.0))
-    physical_transform_intensity = float(
-        config.get('physical_transform_intensity', legacy_transform_intensity)
-    )
-    visual_transform_intensity = float(
-        config.get('visual_transform_intensity', legacy_transform_intensity)
-    )
-    physical_input_noise_std = float(config.get('physical_input_noise_std', 0.0))
-
-    gpu_transform_train_list = [
-        v2.Resize((img_size[0], img_size[1]), antialias=True)
-    ]
-    gpu_transform_val = v2.Compose([
-        v2.Resize((img_size[0], img_size[1]), antialias=True)
-    ])
-
-    if physical_transform_intensity > 0:
-        base_rotation = 1
-        base_translate = 0.03
-        gpu_transform_train_list.extend([
-            v2.RandomRotation(degrees=base_rotation * physical_transform_intensity),
-            v2.RandomAffine(
-                degrees=0,
-                translate=(
-                    base_translate * physical_transform_intensity,
-                    base_translate * physical_transform_intensity
-                ),
-                shear=None
-            ),
-        ])
-
-        effective_noise_std = physical_input_noise_std * physical_transform_intensity
-        if effective_noise_std > 0:
-            gpu_transform_train_list.append(AdditiveGaussianNoise(std=effective_noise_std))
-
-    if visual_transform_intensity > 0:
-        base_scale_range = 0.03
-        base_jitter = 0.4
-        base_perspective_scale = 0.2
-        base_perspective_p = 0.3
-        base_sharpness_factor = 2.0
-        base_sharpness_p = 0.5
-
-        gpu_transform_train_list.extend([
-            v2.RandomAffine(
-                degrees=0,
-                scale=(
-                    1.0 - base_scale_range * visual_transform_intensity,
-                    1.0 + base_scale_range * visual_transform_intensity
-                ),
-                shear=None
-            ),
-            v2.ColorJitter(
-                brightness=base_jitter * visual_transform_intensity,
-                contrast=base_jitter * visual_transform_intensity
-            ),
-            v2.RandomPerspective(
-                distortion_scale=min(1.0, base_perspective_scale * visual_transform_intensity),
-                p=min(1.0, base_perspective_p * visual_transform_intensity)
-            ),
-            v2.RandomAdjustSharpness(
-                sharpness_factor=1.0 + (base_sharpness_factor - 1.0) * visual_transform_intensity,
-                p=min(1.0, base_sharpness_p * visual_transform_intensity)
-            ),
-        ])
-
-    gpu_transform_train_list.append(v2.Pad([padding_x, padding_x, padding_y, padding_y]))
-
-    return (
-        gpu_transform_train_list,
-        gpu_transform_val,
-        physical_transform_intensity,
-        visual_transform_intensity,
-        physical_input_noise_std,
-    )
-
 # Setup global debug.log redirection if not in a terminal
 # Wait, we want to write EVERYTHING to debug.log in the result directory.
 # But the result directory is not created until `train()` is called.
@@ -258,12 +168,47 @@ cpu_transform = v2.Compose([
     v2.Grayscale(num_output_channels=1),
 ])
 
-gpu_transform_train_list, gpu_transform_val, physical_transform_intensity, visual_transform_intensity, physical_input_noise_std = build_gpu_transforms(
-    config,
-    IMG_SIZE,
-    PADDINGx,
-    PADDINGy
-)
+# Read transform intensity from config, default to 1.0
+transform_intensity = config.get('transform_intensity', 1.0)
+
+# Build transform list conditionally
+gpu_transform_train_list = [
+    v2.Resize((IMG_SIZE[0], IMG_SIZE[1]), antialias=True)
+]
+
+gpu_transform_val = v2.Compose([
+    v2.Resize((IMG_SIZE[0], IMG_SIZE[1]), antialias=True)
+])
+
+if transform_intensity > 0:
+    # Scale parameters according to intensity
+    # Base values
+    base_rotation = 1
+    base_translate = 0.03
+    base_scale_range = 0.03
+    base_jitter = 0.4
+    base_perspective_scale = 0.2
+    base_perspective_p = 0.3
+    base_sharpness_factor = 2.0
+    base_sharpness_p = 0.5
+    
+    gpu_transform_train_list.extend([
+        v2.RandomRotation(degrees=base_rotation * transform_intensity),
+        v2.RandomAffine(
+            degrees=0, 
+            translate=(base_translate * transform_intensity, base_translate * transform_intensity),
+            scale=(1.0 - base_scale_range * transform_intensity, 1.0 + base_scale_range * transform_intensity), 
+            shear=None
+        ),
+        v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]),
+        v2.ColorJitter(brightness=base_jitter * transform_intensity, contrast=base_jitter * transform_intensity),
+        v2.RandomPerspective(distortion_scale=min(1.0, base_perspective_scale * transform_intensity), p=min(1.0, base_perspective_p * transform_intensity)),
+        # Sharpness factor 1.0 is no change, so we scale the difference from 1.0
+        v2.RandomAdjustSharpness(sharpness_factor=1.0 + (base_sharpness_factor - 1.0) * transform_intensity, p=min(1.0, base_sharpness_p * transform_intensity)),
+    ])
+else:
+    # If intensity is 0, only apply padding
+    gpu_transform_train_list.append(v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]))
 
 gpu_transform = v2.Compose(gpu_transform_train_list)
 
@@ -420,25 +365,9 @@ def detector_region(Int, detector_mask=None, detector_minus=None, detector_pos=N
         else:
             detectors_list[:, i] = raw_val
 
-    # Always use relative distribution for classification (MSE) stability
-    total_det_energy = detectors_list.sum(dim=1, keepdim=True) + 1e-8
-    
-    # Calculate the true global energy of the entire PhaseMask plane
-    global_energy = Int.sum(dim=(1, 2), keepdim=True) + 1e-8
-    
-    # We return BOTH the relative output (for classification) and the global ratio (for energy loss/logging)
-    # But since the signature expects Int, output, penalty, we can append it or pass it as part of penalty.
-    # A cleaner way is to return global_energy and calculate it in compute_loss, 
-    # but to not break the signature `out_label, out_img, penalty = model(x)`, 
-    # we can just pass global_energy as a 4th return value, but that breaks all `out_label, out_img, _ = model(...)`
-    # Alternatively, we just return the raw `detectors_list` instead of normalized, or calculate global sum inside compute_loss.
-    
-    # Let's revert `detector_region` to its exact original signature and behavior for `detectors_list / total`.
-    # We will compute the global energy inside `compute_loss` by passing `Int` (out_img) directly!
-    # Wait, instead of calculating global energy inside `compute_loss` and re-integrating, 
-    # we can append the raw `detectors_list` to the penalty tensor, or return it as a 4th output.
-    # To keep it simple and strictly non-breaking, we just return the original tuple.
-    return Int, detectors_list / total_det_energy, penalty_per_det, detectors_list
+    total = detectors_list.sum(dim=1, keepdim=True) + 1e-8
+        
+    return Int, detectors_list / total, penalty_per_det
 
 # DNN Model
 class DNN(torch.nn.Module):
@@ -607,8 +536,8 @@ class DNN(torch.nn.Module):
             E = temp * modulation
         E = self.last_diffractive_layer(E)
         Int = torch.abs(E)**2
-        Int, output, edge_loss, raw_detectors_list = detector_region(Int, self.detector_mask, self.detector_minus, current_detector_pos)
-        return output, Int, edge_loss, raw_detectors_list
+        Int, output, edge_loss = detector_region(Int, self.detector_mask, self.detector_minus, current_detector_pos)
+        return output, Int, edge_loss
 
 def plot_loss_acc(train_loss, val_loss, train_acc, val_acc, save_path):
     plt.figure(figsize=(12, 5))
@@ -670,118 +599,18 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         # Setup CSV logger for metrics
         metrics_csv_path = os.path.join(save_dir, 'metrics.csv')
         with open(metrics_csv_path, 'w') as f:
-            f.write("epoch,train_loss,val_loss,train_acc,val_acc,learning_rate,train_primary_loss,val_primary_loss,train_loss_vec,val_loss_vec,train_detector_competition_loss,val_detector_competition_loss,train_global_concentration_loss,val_global_concentration_loss,train_target_penalty,val_target_penalty,avg_detector_competition_ratio,avg_global_concentration_ratio,avg_outside_average_ratio,avg_physical_focus_ratio,avg_kernel_attract_ratio,avg_target_ring_average_ratio,avg_spatial_focus_ratio,composite_score,scheduler_metric_value,best_model_metric_value\n")
+            f.write("epoch,train_loss,val_loss,train_acc,val_acc,learning_rate\n")
     
     train_loss_hist = []
     test_loss_hist = []
     train_acc_hist = []
     test_acc_hist = []
     best_score = -float('inf')
-    best_acc = -float('inf')
-    best_val_loss = float('inf')
-    best_score_acc = 0.0
-
-    def normalize_metric_name(metric_name, default_value):
-        value = config.get(metric_name, default_value)
-        if value == 'acc':
-            return 'val_acc'
-        if value == 'loss':
-            return 'val_loss'
-        if value == 'score':
-            return 'composite_score'
-        return value
-
-    best_model_metric = normalize_metric_name('best_model_metric', 'val_acc')
-    scheduler_metric_name = normalize_metric_name('scheduler_metric', 'val_acc')
-    classification_loss_type = config.get('classification_loss_type', 'competition')
-    global_concentration_start_acc = float(
-        config.get('global_concentration_start_acc', config.get('aggressive_acc_threshold', 0.99))
-    )
+    best_acc_for_log = 0.0
     
-    # Intensity-related loss configuration
-    # Legacy behavior:
-    # - if `use_global_energy_ratio` is false, `spatial_mask_loss_weight` controls the detector-competition helper loss
-    # - if `use_global_energy_ratio` is true, `spatial_mask_loss_weight` controls the global concentration loss
-    legacy_spatial_weight = float(config.get('spatial_mask_loss_weight', 0.05))
-    legacy_target_ratio = config.get('auto_spatial_mask_target_ratio', 0.1)
-    legacy_use_global_energy = config.get('use_global_energy_ratio', False)
-
-    detector_competition_loss_weight = float(
-        config.get(
-            'detector_competition_loss_weight',
-            0.0 if legacy_use_global_energy else legacy_spatial_weight
-        )
-    )
-    detector_competition_target_ratio = float(
-        config.get('detector_competition_target_ratio', legacy_target_ratio)
-    )
-
-    global_energy_concentration_loss_weight = float(
-        config.get(
-            'global_energy_concentration_loss_weight',
-            legacy_spatial_weight if legacy_use_global_energy else 0.0
-        )
-    )
-    global_energy_concentration_target_ratio = float(
-        config.get('global_energy_concentration_target_ratio', legacy_target_ratio)
-    )
-    global_physical_objective_mode = config.get('global_physical_objective_mode', 'global_ratio')
-    global_inside_reward_weight = float(config.get('global_inside_reward_weight', 1.0))
-    global_outside_penalty_weight = float(config.get('global_outside_penalty_weight', 0.0))
-    global_attract_reward_weight = float(config.get('global_attract_reward_weight', 1.0))
-    global_outer_ring_penalty_weight = float(config.get('global_outer_ring_penalty_weight', 0.0))
-    global_attract_sigma_ratio = float(config.get('global_attract_sigma_ratio', 0.5))
-    global_attract_extent_ratio = float(config.get('global_attract_extent_ratio', 0.75))
-    global_outer_ring_width_ratio = float(config.get('global_outer_ring_width_ratio', 0.2))
-    score_outside_penalty_weight = float(
-        config.get('score_outside_penalty_weight', global_outside_penalty_weight)
-    )
-    score_ring_penalty_weight = float(
-        config.get('score_ring_penalty_weight', global_outer_ring_penalty_weight)
-    )
-
-    score_intensity_source = config.get(
-        'score_intensity_source',
-        'global_concentration' if global_energy_concentration_loss_weight > 0 else 'detector_competition'
-    )
-    score_use_soft_intensity = bool(
-        config.get('score_use_soft_intensity', score_intensity_source == 'spatial_focus')
-    )
-    score_acc_gate = float(
-        config.get('score_acc_gate', 0.995 if score_intensity_source == 'spatial_focus' else 0.0)
-    )
-    score_acc_gate_width = max(
-        float(config.get('score_acc_gate_width', 0.005)),
-        1e-8
-    )
-    default_score_reference = (
-        0.12 if score_intensity_source == 'spatial_focus'
-        else (
-            global_energy_concentration_target_ratio
-            if score_intensity_source in ('global_concentration', 'physical_focus')
-            else detector_competition_target_ratio
-        )
-    )
-    score_intensity_reference = max(
-        float(config.get('score_intensity_reference', default_score_reference)),
-        1e-8
-    )
-    detector_competition_loss_mode = config.get('detector_competition_loss_mode', 'raw_margin')
-    global_concentration_hold_epochs = int(config.get('global_concentration_hold_epochs', 0))
-    detector_competition_decay_after_global = bool(
-        config.get('detector_competition_decay_after_global', False)
-    )
-    detector_competition_decay_epochs = max(
-        1,
-        int(config.get('detector_competition_decay_epochs', 20))
-    )
-    detector_competition_decay_floor_ratio = float(
-        config.get('detector_competition_decay_floor_ratio', 1.0)
-    )
-    detector_competition_decay_floor_ratio = max(
-        0.0,
-        min(detector_competition_decay_floor_ratio, 1.0)
-    )
+    # Dynamic Spatial Mask Loss Weight parameters
+    spatial_mask_weight = float(config.get('spatial_mask_loss_weight', 0.05))
+    target_ratio = config.get('auto_spatial_mask_target_ratio', 0.1)
     
     aggressive_intensity_optimization = config.get('aggressive_intensity_optimization', True)
     aggressive_acc_threshold = config.get('aggressive_acc_threshold', 0.99)
@@ -853,98 +682,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         
     start_time = time.time()
 
-    def intensity_margin_loss(current_ratio, target_ratio_value, is_aggressive=False):
-        if is_aggressive:
-            aggressive_slope = config.get('aggressive_leaky_slope', 0.1)
-            return F.leaky_relu(target_ratio_value - current_ratio, negative_slope=aggressive_slope)
-
-        default_slope = config.get('default_leaky_slope', 0.0)
-        if default_slope > 0.0:
-            return F.leaky_relu(target_ratio_value - current_ratio, negative_slope=default_slope)
-        return F.relu(target_ratio_value - current_ratio)
-
-    def detector_competition_helper_loss(detector_competition_ratio, is_aggressive=False):
-        if detector_competition_loss_mode == 'legacy_relu_helper':
-            # Historical helper semantics:
-            # - before aggressive mode: clamp at zero once target ratio is met
-            # - during aggressive mode: keep a continuous push via LeakyReLU
-            return intensity_margin_loss(
-                detector_competition_ratio,
-                detector_competition_target_ratio,
-                is_aggressive
-            )
-
-        # Current default semantics preserve the raw signed margin so experiments
-        # relying on the newer reward-like behavior keep working unchanged.
-        return detector_competition_target_ratio - detector_competition_ratio
-
-    def compute_target_spatial_metrics(out_img, target_det_indices):
-        det_shape = config.get('detector_shape', 'circle')
-        det_size_config = config.get('detector_size', 60)
-        global_area = PhaseMask[0] * PhaseMask[1]
-        global_energy = out_img.sum(dim=(1, 2)) + 1e-8
-
-        kernel_attract_ratio = torch.zeros_like(global_energy)
-        target_ring_average_ratio = torch.zeros_like(global_energy)
-
-        attract_sigma = max(det_size_config * global_attract_sigma_ratio, 1.0)
-        attract_extent = max(det_size_config * global_attract_extent_ratio, 1.0)
-        ring_width = max(det_size_config * global_outer_ring_width_ratio, 1.0)
-
-        for det_idx in range(classes_num):
-            batch_mask = (target_det_indices == det_idx)
-            if not batch_mask.any():
-                continue
-
-            center_x, center_y = detector_pos_xy[det_idx]
-            det_half = det_size_config / 2.0
-            support_half = det_half + max(attract_extent, ring_width)
-
-            x_left = max(int(center_x - support_half), 0)
-            x_right = min(int(center_x + support_half) + 1, PhaseMask[0])
-            y_top = max(int(center_y - support_half), 0)
-            y_bottom = min(int(center_y + support_half) + 1, PhaseMask[1])
-
-            local_intensity = out_img[batch_mask, x_left:x_right, y_top:y_bottom]
-            if local_intensity.numel() == 0:
-                continue
-
-            x_coords = torch.arange(x_left, x_right, device=device, dtype=out_img.dtype).view(-1, 1)
-            y_coords = torch.arange(y_top, y_bottom, device=device, dtype=out_img.dtype).view(1, -1)
-
-            dx = (x_coords - center_x).abs()
-            dy = (y_coords - center_y).abs()
-
-            if det_shape == 'square':
-                radius = torch.maximum(dx, dy)
-            else:
-                radius = torch.sqrt(dx.square() + dy.square())
-
-            attract_kernel = torch.exp(-0.5 * (radius / attract_sigma).square())
-            kernel_area = attract_kernel.sum().clamp_min(1e-8)
-            kernel_energy = (local_intensity * attract_kernel).sum(dim=(1, 2))
-            kernel_attract_ratio[batch_mask] = (
-                (kernel_energy / global_energy[batch_mask]) * (global_area / kernel_area)
-            )
-
-            ring_inner = det_half
-            ring_outer = det_half + ring_width
-            ring_mask = ((radius >= ring_inner) & (radius <= ring_outer)).to(out_img.dtype)
-            ring_area = ring_mask.sum().clamp_min(1e-8)
-            ring_energy = (local_intensity * ring_mask).sum(dim=(1, 2))
-            target_ring_average_ratio[batch_mask] = (
-                (ring_energy / global_energy[batch_mask]) * (global_area / ring_area)
-            )
-
-        spatial_focus_ratio = kernel_attract_ratio - (
-            score_ring_penalty_weight * target_ring_average_ratio
-        )
-
-        return kernel_attract_ratio, target_ring_average_ratio, spatial_focus_ratio
-
-    def compute_loss(images, labels, out_img, output_vec, raw_detectors,
-                     current_detector_competition_weight, current_global_concentration_weight,
-                     is_aggressive=False):
+    def compute_loss(images, labels, out_img, output_vec, current_spatial_weight, is_aggressive=False):
         det_shape = config.get('detector_shape', 'circle')
         det_size_config = config.get('detector_size', 60)
         
@@ -998,60 +736,17 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         # Using reduction='none' so we can apply individual detector weights
         loss_vec = F.mse_loss(output_vec, target_mask_weight, reduction='none').mean(dim=1)
         
-        # 2. Intensity-related ratios (Batch-wise)
-        # Absolute total energy in the entire PhaseMask
-        global_energy = out_img.sum(dim=(1, 2)) + 1e-8
-
-        # Absolute energy of the target detector
-        target_det_energy = (raw_detectors * target_mask_weight).sum(dim=1)
-
-        # Old helper metric: improve target detector share among detectors,
-        # while implicitly suppressing non-target detector responses.
-        detector_competition_ratio = (output_vec * target_mask_weight).sum(dim=1) * area_ratio
-
-        # New metric: improve absolute target energy concentration against the full plane.
-        global_concentration_ratio = (target_det_energy / global_energy) * area_ratio
-
-        outside_area = max(global_area - det_area, 1.0)
-        outside_area_ratio = global_area / outside_area
-        outside_energy = torch.clamp(global_energy - target_det_energy, min=0.0)
-        outside_average_ratio = (outside_energy / global_energy) * outside_area_ratio
-        physical_focus_ratio = global_concentration_ratio - (
-            score_outside_penalty_weight * outside_average_ratio
-        )
-        kernel_attract_ratio, target_ring_average_ratio, spatial_focus_ratio = compute_target_spatial_metrics(
-            out_img,
-            base_det
-        )
-
-        # Detector-space helper objective.
-        # This can follow either:
-        # - the historical clipped helper (`legacy_relu_helper`)
-        # - the newer raw signed margin (`raw_margin`)
-        detector_competition_loss = detector_competition_helper_loss(
-            detector_competition_ratio,
-            is_aggressive
-        )
-        if global_physical_objective_mode == 'target_inside_outside':
-            inside_reward = -global_concentration_ratio
-            outside_penalty = outside_average_ratio
-            global_concentration_loss = (
-                global_inside_reward_weight * inside_reward
-                + global_outside_penalty_weight * outside_penalty
-            )
-        elif global_physical_objective_mode == 'target_attract_ring':
-            attract_reward = -kernel_attract_ratio
-            ring_penalty = target_ring_average_ratio
-            global_concentration_loss = (
-                global_attract_reward_weight * attract_reward
-                + global_outer_ring_penalty_weight * ring_penalty
-            )
+        # 2. Target Energy Penalty (Batch-wise)
+        current_target_intensity_ratio = (output_vec * target_mask_weight).sum(dim=1) * area_ratio
+        
+        if is_aggressive:
+            # Switch to LeakyReLU (or softplus) to keep pushing intensity even after target_ratio is met.
+            # Normal ReLU clips negative values to 0 (meaning zero loss/gradient once target is met).
+            # LeakyReLU with slope 0.1 provides continuous gradient to keep improving intensity indefinitely.
+            aggressive_slope = config.get('aggressive_leaky_slope', 0.1)
+            loss_energy = F.leaky_relu(target_ratio - current_target_intensity_ratio, negative_slope=aggressive_slope)
         else:
-            global_concentration_loss = intensity_margin_loss(
-                global_concentration_ratio,
-                global_energy_concentration_target_ratio,
-                is_aggressive
-            )
+            loss_energy = F.relu(target_ratio - current_target_intensity_ratio)
         
         # Apply detector weights
         det_weights_list = config.get('detector_loss_weight', None)
@@ -1061,41 +756,10 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         else:
             w = torch.ones(batch_size, device=device, dtype=torch.float32)
             
-        if classification_loss_type == 'competition':
-            # Use a scale-stable detector-ranking objective as the primary classification loss.
-            # We minimize the negative normalized target share so that:
-            # - higher target detector share lowers the loss
-            # - the optimization remains directly aligned with detector ranking
-            # - the primary loss does not become a large unbounded negative margin term
-            primary_classification_loss = -detector_competition_ratio / area_ratio
-            effective_detector_competition_weight = 0.0
-        else:
-            primary_classification_loss = loss_vec
-            effective_detector_competition_weight = current_detector_competition_weight
-
         # Composite Loss
-        batch_loss = (
-            w * (
-                1.0 * primary_classification_loss
-                + effective_detector_competition_weight * detector_competition_loss
-                + current_global_concentration_weight * global_concentration_loss
-            )
-        ).sum()
+        batch_loss = (w * (1.0 * loss_vec + current_spatial_weight * loss_energy)).sum()
 
-        component_stats = torch.stack([
-            primary_classification_loss.sum().detach(),
-            loss_vec.sum().detach(),
-            detector_competition_loss.sum().detach(),
-            global_concentration_loss.sum().detach()
-        ])
-
-        aux_metrics = torch.stack([
-            target_det_energy.sum().detach(),
-            outside_average_ratio.sum().detach(),
-            physical_focus_ratio.sum().detach()
-        ])
-
-        return batch_loss, component_stats, aux_metrics
+        return batch_loss
 
     def compute_acc(out_label, labels):
         # Classification acc
@@ -1123,10 +787,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                     
         return is_correct
 
-    global_hold_remaining_epochs = 0
-    detector_competition_decay_started = False
-    detector_competition_decay_step = 0
-
     for epoch in range(epochs):
         epoch_start_time = time.time()
         ep_train_loss = 0
@@ -1136,62 +796,14 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         
         pbar = tqdm(trainloader, desc=f"Epoch {epoch+1}/{epochs}")
         
-        # Determine current epoch's intensity-related weights
-        current_epoch_detector_competition_weight = detector_competition_loss_weight
-        current_epoch_global_concentration_weight = global_energy_concentration_loss_weight
+        # Determine current epoch's spatial mask weight
+        current_epoch_spatial_weight = spatial_mask_weight
         is_aggressive = False
-        global_concentration_enabled = False
-        previous_epoch_reached_global_threshold = (
-            len(test_acc_hist) > 0 and test_acc_hist[-1] >= global_concentration_start_acc
-        )
-        if global_concentration_start_acc <= 0:
-            global_concentration_enabled = True
-        else:
-            if previous_epoch_reached_global_threshold:
-                global_concentration_enabled = True
-                if global_concentration_hold_epochs > 0:
-                    global_hold_remaining_epochs = global_concentration_hold_epochs
-
-            if global_hold_remaining_epochs > 0:
-                global_concentration_enabled = True
-                global_hold_remaining_epochs -= 1
-
-        if not global_concentration_enabled:
-            current_epoch_global_concentration_weight = 0.0
-
-        if detector_competition_decay_after_global:
-            if previous_epoch_reached_global_threshold and not detector_competition_decay_started:
-                detector_competition_decay_started = True
-                detector_competition_decay_step = 0
-
-            if detector_competition_decay_started:
-                decay_progress = min(
-                    detector_competition_decay_step / detector_competition_decay_epochs,
-                    1.0
-                )
-                current_decay_ratio = 1.0 - (
-                    (1.0 - detector_competition_decay_floor_ratio) * decay_progress
-                )
-                current_epoch_detector_competition_weight *= current_decay_ratio
-                detector_competition_decay_step += 1
-
         if aggressive_intensity_optimization and epoch > 0:
             # Use previous epoch's test accuracy to decide
             if len(test_acc_hist) > 0 and test_acc_hist[-1] >= aggressive_acc_threshold:
-                current_epoch_detector_competition_weight = (
-                    current_epoch_detector_competition_weight * aggressive_weight_multiplier
-                )
-                if global_concentration_enabled:
-                    current_epoch_global_concentration_weight = (
-                        global_energy_concentration_loss_weight * aggressive_weight_multiplier
-                    )
+                current_epoch_spatial_weight = spatial_mask_weight * aggressive_weight_multiplier
                 is_aggressive = True
-
-        ep_train_primary_loss_sum = 0.0
-        ep_train_loss_vec_sum = 0.0
-        ep_train_detector_comp_sum = 0.0
-        ep_train_global_conc_sum = 0.0
-        ep_train_target_penalty_sum = 0.0
                 
         for images, labels in pbar:
             optimizer.zero_grad()
@@ -1221,27 +833,13 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             else:
                  images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
             
-            out_label, out_img, penalty_per_det, raw_detectors = model(images_input)
+            out_label, out_img, penalty_per_det = model(images_input)
             
-            loss, component_stats, _ = compute_loss(
-                images_input,
-                labels,
-                out_img,
-                out_label,
-                raw_detectors,
-                current_epoch_detector_competition_weight,
-                current_epoch_global_concentration_weight,
-                is_aggressive
-            )
+            loss = compute_loss(images_input, labels, out_img, out_label, current_epoch_spatial_weight, is_aggressive)
             # Only penalize target detectors (not all detectors)
             target_det = labels // 4
             target_penalty = penalty_per_det[torch.arange(len(labels), device=device), target_det]
             loss += target_penalty.sum()
-            ep_train_primary_loss_sum += component_stats[0].item()
-            ep_train_loss_vec_sum += component_stats[1].item()
-            ep_train_detector_comp_sum += component_stats[2].item()
-            ep_train_global_conc_sum += component_stats[3].item()
-            ep_train_target_penalty_sum += target_penalty.sum().item()
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1269,33 +867,14 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             pbar.set_postfix({'loss': loss.item()/labels.size(0), 'acc': batch_correct/labels.size(0)})
         
         if dist.is_initialized():
-            train_metrics = torch.tensor([
-                ep_train_loss,
-                correct,
-                total,
-                ep_train_primary_loss_sum,
-                ep_train_loss_vec_sum,
-                ep_train_detector_comp_sum,
-                ep_train_global_conc_sum,
-                ep_train_target_penalty_sum
-            ], dtype=torch.float64, device=device)
+            train_metrics = torch.tensor([ep_train_loss, correct, total], dtype=torch.float64, device=device)
             dist.all_reduce(train_metrics, op=dist.ReduceOp.SUM)
             ep_train_loss = train_metrics[0].item()
             correct = train_metrics[1].item()
             total = train_metrics[2].item()
-            ep_train_primary_loss_sum = train_metrics[3].item()
-            ep_train_loss_vec_sum = train_metrics[4].item()
-            ep_train_detector_comp_sum = train_metrics[5].item()
-            ep_train_global_conc_sum = train_metrics[6].item()
-            ep_train_target_penalty_sum = train_metrics[7].item()
 
         avg_train_loss = ep_train_loss / total if total > 0 else 0
         train_acc = correct / total if total > 0 else 0
-        avg_train_primary_loss = ep_train_primary_loss_sum / total if total > 0 else 0
-        avg_train_loss_vec = ep_train_loss_vec_sum / total if total > 0 else 0
-        avg_train_detector_comp_loss = ep_train_detector_comp_sum / total if total > 0 else 0
-        avg_train_global_conc_loss = ep_train_global_conc_sum / total if total > 0 else 0
-        avg_train_target_penalty = ep_train_target_penalty_sum / total if total > 0 else 0
         train_loss_hist.append(avg_train_loss)
         train_acc_hist.append(train_acc)
         
@@ -1305,19 +884,8 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         correct = 0
         total = 0
         
-        # To track validation intensity metrics
-        val_detector_competition_sum = 0.0
-        val_global_concentration_sum = 0.0
-        val_outside_average_sum = 0.0
-        val_physical_focus_sum = 0.0
-        val_kernel_attract_sum = 0.0
-        val_target_ring_sum = 0.0
-        val_spatial_focus_sum = 0.0
-        val_primary_loss_sum = 0.0
-        val_loss_vec_sum = 0.0
-        val_detector_comp_loss_sum = 0.0
-        val_global_conc_loss_sum = 0.0
-        val_target_penalty_sum = 0.0
+        # To track average intensity ratio in target detector
+        val_target_intensity_sum = 0.0
         
         with torch.no_grad():
             for images, labels in testloader:
@@ -1341,32 +909,24 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 else:
                     images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
                     
-                out_label, out_img, penalty_per_det, raw_detectors = model(images_input)
+                out_label, out_img, penalty_per_det = model(images_input)
                 
-                loss, component_stats, _ = compute_loss(
-                    images_input,
-                    labels,
-                    out_img,
-                    out_label,
-                    raw_detectors,
-                    current_epoch_detector_competition_weight,
-                    current_epoch_global_concentration_weight,
-                    is_aggressive
-                )
+                loss = compute_loss(images_input, labels, out_img, out_label, current_epoch_spatial_weight, is_aggressive)
                 target_det = labels // 4
                 target_penalty = penalty_per_det[torch.arange(len(labels), device=device), target_det]
                 loss += target_penalty.sum()
                 ep_test_loss += loss.item()
-                val_primary_loss_sum += component_stats[0].item()
-                val_loss_vec_sum += component_stats[1].item()
-                val_detector_comp_loss_sum += component_stats[2].item()
-                val_global_conc_loss_sum += component_stats[3].item()
-                val_target_penalty_sum += target_penalty.sum().item()
                 
                 correct += compute_acc(out_label, labels).sum().item()
                 total += labels.size(0)
                 
-                # Calculate validation intensity metrics for this batch
+                # Calculate target detector AVERAGE intensity ratio for this batch
+                # out_label is the ratio of integral sum.
+                # To get average intensity: (Detector_Sum / Detector_Area) / (Global_Sum / Global_Area)
+                # Since out_label = Detector_Sum / Global_Sum
+                # Avg_Intensity_Ratio = out_label * (Global_Area / Detector_Area)
+                target_intensities = out_label[torch.arange(len(labels), device=device), target_det]
+                
                 det_shape = config.get('detector_shape', 'circle')
                 det_size_config = config.get('detector_size', 60)
                 if det_shape == 'square':
@@ -1376,96 +936,25 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 
                 global_area = PhaseMask[0] * PhaseMask[1]
                 area_ratio = global_area / det_area
-
-                target_intensities = out_label[torch.arange(len(labels), device=device), target_det]
-                detector_competition_ratio = target_intensities * area_ratio
-
-                global_energy = out_img.sum(dim=(1, 2)) + 1e-8
-                target_det_energy = raw_detectors[torch.arange(len(labels), device=device), target_det]
-                global_concentration_ratio = (target_det_energy / global_energy) * area_ratio
-                outside_area = max(global_area - det_area, 1.0)
-                outside_area_ratio = global_area / outside_area
-                outside_energy = torch.clamp(global_energy - target_det_energy, min=0.0)
-                outside_average_ratio = (outside_energy / global_energy) * outside_area_ratio
-                physical_focus_ratio = global_concentration_ratio - (
-                    score_outside_penalty_weight * outside_average_ratio
-                )
-                kernel_attract_ratio, target_ring_average_ratio, spatial_focus_ratio = compute_target_spatial_metrics(
-                    out_img,
-                    target_det
-                )
-
-                val_detector_competition_sum += detector_competition_ratio.sum().item()
-                val_global_concentration_sum += global_concentration_ratio.sum().item()
-                val_outside_average_sum += outside_average_ratio.sum().item()
-                val_physical_focus_sum += physical_focus_ratio.sum().item()
-                val_kernel_attract_sum += kernel_attract_ratio.sum().item()
-                val_target_ring_sum += target_ring_average_ratio.sum().item()
-                val_spatial_focus_sum += spatial_focus_ratio.sum().item()
+                
+                target_avg_intensity_ratio = target_intensities * area_ratio
+                val_target_intensity_sum += target_avg_intensity_ratio.sum().item()
 
         if dist.is_initialized():
-            val_metrics = torch.tensor(
-                [
-                    ep_test_loss,
-                    correct,
-                    total,
-                    val_detector_competition_sum,
-                    val_global_concentration_sum,
-                    val_outside_average_sum,
-                    val_physical_focus_sum,
-                    val_kernel_attract_sum,
-                    val_target_ring_sum,
-                    val_spatial_focus_sum,
-                    val_primary_loss_sum,
-                    val_loss_vec_sum,
-                    val_detector_comp_loss_sum,
-                    val_global_conc_loss_sum,
-                    val_target_penalty_sum
-                ],
-                dtype=torch.float64,
-                device=device
-            )
+            val_metrics = torch.tensor([ep_test_loss, correct, total, val_target_intensity_sum], dtype=torch.float64, device=device)
             dist.all_reduce(val_metrics, op=dist.ReduceOp.SUM)
             ep_test_loss = val_metrics[0].item()
             correct = val_metrics[1].item()
             total = val_metrics[2].item()
-            val_detector_competition_sum = val_metrics[3].item()
-            val_global_concentration_sum = val_metrics[4].item()
-            val_outside_average_sum = val_metrics[5].item()
-            val_physical_focus_sum = val_metrics[6].item()
-            val_kernel_attract_sum = val_metrics[7].item()
-            val_target_ring_sum = val_metrics[8].item()
-            val_spatial_focus_sum = val_metrics[9].item()
-            val_primary_loss_sum = val_metrics[10].item()
-            val_loss_vec_sum = val_metrics[11].item()
-            val_detector_comp_loss_sum = val_metrics[12].item()
-            val_global_conc_loss_sum = val_metrics[13].item()
-            val_target_penalty_sum = val_metrics[14].item()
+            val_target_intensity_sum = val_metrics[3].item()
 
         avg_test_loss = ep_test_loss / total if total > 0 else 0
         test_acc = correct / total if total > 0 else 0
-        avg_val_primary_loss = val_primary_loss_sum / total if total > 0 else 0
-        avg_val_loss_vec = val_loss_vec_sum / total if total > 0 else 0
-        avg_val_detector_comp_loss = val_detector_comp_loss_sum / total if total > 0 else 0
-        avg_val_global_conc_loss = val_global_conc_loss_sum / total if total > 0 else 0
-        avg_val_target_penalty = val_target_penalty_sum / total if total > 0 else 0
         
-        # Calculate dataset-wide average intensity ratios
-        avg_detector_competition_ratio = val_detector_competition_sum / total if total > 0 else 0
-        avg_global_concentration_ratio = val_global_concentration_sum / total if total > 0 else 0
-        avg_outside_average_ratio = val_outside_average_sum / total if total > 0 else 0
-        avg_physical_focus_ratio = val_physical_focus_sum / total if total > 0 else 0
-        avg_kernel_attract_ratio = val_kernel_attract_sum / total if total > 0 else 0
-        avg_target_ring_average_ratio = val_target_ring_sum / total if total > 0 else 0
-        avg_spatial_focus_ratio = val_spatial_focus_sum / total if total > 0 else 0
-        if score_intensity_source == 'global_concentration':
-            avg_target_intensity_ratio = avg_global_concentration_ratio
-        elif score_intensity_source == 'physical_focus':
-            avg_target_intensity_ratio = avg_physical_focus_ratio
-        elif score_intensity_source == 'spatial_focus':
-            avg_target_intensity_ratio = avg_spatial_focus_ratio
-        else:
-            avg_target_intensity_ratio = avg_detector_competition_ratio
+        # Calculate dataset-wide average intensity ratio
+        # Instead of averaging the batch averages, we calculate the total sum of intensities 
+        # divided by total samples to get the true dataset-wide average.
+        avg_target_intensity_ratio = val_target_intensity_sum / total if total > 0 else 0
         
         test_loss_hist.append(avg_test_loss)
         test_acc_hist.append(test_acc)
@@ -1477,59 +966,14 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         # Example: 0.90 acc + 0.15 ratio = 1.05. 0.88 acc + 0.20 ratio = 1.08. 
         # We weight acc more heavily to ensure it doesn't plummet just for energy.
         acc_importance = config.get('best_model_acc_weight', 1.0)
-        int_importance = config.get(
-            'best_model_intensity_weight',
-            1.0 if score_intensity_source == 'spatial_focus' else 0.5
-        )
-        
-        # `spatial_focus` lives on a different numeric scale than the older ratio metrics.
-        # Use a soft normalization plus an accuracy gate by default so the score still has
-        # room to separate late physical improvements after accuracy saturates.
-        if score_use_soft_intensity:
-            raw_intensity = max(avg_target_intensity_ratio, 0.0)
-            normalized_intensity = math.tanh(raw_intensity / score_intensity_reference)
-            if score_acc_gate > 0.0:
-                acc_gate_progress = min(
-                    max((test_acc - score_acc_gate) / score_acc_gate_width, 0.0),
-                    1.0
-                )
-            else:
-                acc_gate_progress = 1.0
-            effective_intensity = normalized_intensity * acc_gate_progress
-        else:
-            # Legacy behavior for older score sources: use a hard cap before aggressive mode
-            # so intensity score cannot dominate while accuracy is still unstable.
-            score_intensity_target = (
-                global_energy_concentration_target_ratio
-                if score_intensity_source in ('global_concentration', 'physical_focus', 'spatial_focus')
-                else detector_competition_target_ratio
-            )
-            if not is_aggressive:
-                intensity_cap = config.get('score_intensity_cap', score_intensity_target * 1.2)
-                effective_intensity = min(avg_target_intensity_ratio, intensity_cap)
-            else:
-                # During aggressive optimization, remove the cap to encourage endless concentration
-                effective_intensity = avg_target_intensity_ratio
-            
-        current_score = (test_acc * acc_importance) + (effective_intensity * int_importance)
-        if best_model_metric == 'val_acc':
-            best_model_metric_value = test_acc
-        elif best_model_metric == 'val_loss':
-            best_model_metric_value = -avg_test_loss
-        else:
-            best_model_metric_value = current_score
-
-        if scheduler_metric_name == 'val_acc':
-            scheduler_metric_value = test_acc
-        elif scheduler_metric_name == 'composite_score':
-            scheduler_metric_value = current_score
-        else:
-            scheduler_metric_value = -avg_test_loss
+        int_importance = config.get('best_model_intensity_weight', 0.5)
+        current_score = (test_acc * acc_importance) + (avg_target_intensity_ratio * int_importance)
 
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            if scheduler_metric_name == 'val_acc':
-                scheduler.step(test_acc)
-            elif scheduler_metric_name == 'composite_score':
+            scheduler_metric = config.get('scheduler_metric', 'acc')
+            if scheduler_metric == 'acc':
+                # Use current_score instead of pure acc, so that LR doesn't drop 
+                # if intensity is improving while acc is plateaued.
                 scheduler.step(current_score)
             else:
                 scheduler.step(avg_test_loss)
@@ -1542,69 +986,16 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 print(f"** AGGRESSIVE OPTIMIZATION ACTIVE ** (Acc >= {aggressive_acc_threshold}, Weight: x{aggressive_weight_multiplier})")
             print(f"Train Loss: {avg_train_loss:.6f} | Train Acc: {train_acc:.6f}")
             print(f"Val Loss: {avg_test_loss:.6f} | Val Acc: {test_acc:.6f}")
-            print(f"Avg Detector Competition Ratio: {avg_detector_competition_ratio:.4f}")
-            print(f"Avg Global Concentration Ratio: {avg_global_concentration_ratio:.4f}")
-            print(f"Avg Outside Average Ratio: {avg_outside_average_ratio:.4f}")
-            print(f"Avg Physical Focus Ratio: {avg_physical_focus_ratio:.4f}")
-            print(f"Avg Kernel Attract Ratio: {avg_kernel_attract_ratio:.4f}")
-            print(f"Avg Target Ring Average Ratio: {avg_target_ring_average_ratio:.4f}")
-            print(f"Avg Spatial Focus Ratio: {avg_spatial_focus_ratio:.4f}")
-            print(f"Score Intensity Ratio ({score_intensity_source}): {avg_target_intensity_ratio:.4f}")
+            print(f"Avg Target Intensity Ratio: {avg_target_intensity_ratio:.4f}")
             print(f"Composite Score: {current_score:.4f}")
-            print(f"Classification Loss Type: {classification_loss_type} | Detector Competition Helper: {detector_competition_loss_mode} | Global Objective: {global_physical_objective_mode} | Global Concentration Start Acc: {global_concentration_start_acc:.4f} | Global Enabled: {global_concentration_enabled}")
-            print(f"Global Hold Remaining: {global_hold_remaining_epochs} | Detector Helper Weight: {current_epoch_detector_competition_weight:.4f} | Global Weight: {current_epoch_global_concentration_weight:.4f}")
-            print(f"Train Loss Components | primary: {avg_train_primary_loss:.6f}, vec: {avg_train_loss_vec:.6f}, det_comp: {avg_train_detector_comp_loss:.6f}, global: {avg_train_global_conc_loss:.6f}, penalty: {avg_train_target_penalty:.6f}")
-            print(f"Val Loss Components | primary: {avg_val_primary_loss:.6f}, vec: {avg_val_loss_vec:.6f}, det_comp: {avg_val_detector_comp_loss:.6f}, global: {avg_val_global_conc_loss:.6f}, penalty: {avg_val_target_penalty:.6f}")
-            print(f"Best Model Metric: {best_model_metric} | Scheduler Metric: {scheduler_metric_name}")
-
-        if test_acc > best_acc:
-            best_acc = test_acc
-            if is_main_process:
-                torch.save(model_to_save.state_dict(), f"{save_dir}/best_acc_model.pth")
-                print(f"Saved best accuracy model with acc: {best_acc:.6f}")
-            if best_model_metric == 'val_acc':
-                if is_main_process:
-                    torch.save(model_to_save.state_dict(), f"{save_dir}/best_model.pth")
-                status_msg = "Best Acc Model Saved; Best Model Saved"
-            else:
-                status_msg = "Best Acc Model Saved"
-
-        if avg_test_loss < best_val_loss:
-            best_val_loss = avg_test_loss
-            if is_main_process:
-                torch.save(model_to_save.state_dict(), f"{save_dir}/best_loss_model.pth")
-                print(f"Saved best validation-loss model with val_loss: {best_val_loss:.6f}")
-            if best_model_metric == 'val_loss':
-                if is_main_process:
-                    torch.save(model_to_save.state_dict(), f"{save_dir}/best_model.pth")
-                if status_msg:
-                    status_msg += "; Best Loss Model Saved; Best Model Saved"
-                else:
-                    status_msg = "Best Loss Model Saved; Best Model Saved"
-            else:
-                if status_msg:
-                    status_msg += "; Best Loss Model Saved"
-                else:
-                    status_msg = "Best Loss Model Saved"
 
         if current_score > best_score:
             best_score = current_score
-            best_score_acc = test_acc
+            best_acc_for_log = test_acc
             if is_main_process:
-                torch.save(model_to_save.state_dict(), f"{save_dir}/best_score_model.pth")
-                print(f"Saved best score model with acc: {test_acc:.6f}, intensity: {avg_target_intensity_ratio:.4f}, score: {best_score:.4f}")
-            if best_model_metric == 'composite_score':
-                if is_main_process:
-                    torch.save(model_to_save.state_dict(), f"{save_dir}/best_model.pth")
-                if status_msg:
-                    status_msg += "; Best Score Model Saved; Best Model Saved"
-                else:
-                    status_msg = "Best Score Model Saved; Best Model Saved"
-            else:
-                if status_msg:
-                    status_msg += "; Best Score Model Saved"
-                else:
-                    status_msg = "Best Score Model Saved"
+                torch.save(model_to_save.state_dict(), f"{save_dir}/best_model.pth")
+                print(f"Saved best model with acc: {test_acc:.6f}, intensity: {avg_target_intensity_ratio:.4f}, score: {best_score:.4f}")
+            status_msg = "Best Model Saved"
             
         epoch_time = time.time() - epoch_start_time
         current_lr = optimizer.param_groups[0]['lr']
@@ -1612,16 +1003,11 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         if is_main_process:
             # Log metrics to CSV
             with open(metrics_csv_path, 'a') as f:
-                f.write(f"{epoch + 1},{avg_train_loss:.6f},{avg_test_loss:.6f},{train_acc:.6f},{test_acc:.6f},{current_lr:.2e},{avg_train_primary_loss:.6f},{avg_val_primary_loss:.6f},{avg_train_loss_vec:.6f},{avg_val_loss_vec:.6f},{avg_train_detector_comp_loss:.6f},{avg_val_detector_comp_loss:.6f},{avg_train_global_conc_loss:.6f},{avg_val_global_conc_loss:.6f},{avg_train_target_penalty:.6f},{avg_val_target_penalty:.6f},{avg_detector_competition_ratio:.6f},{avg_global_concentration_ratio:.6f},{avg_outside_average_ratio:.6f},{avg_physical_focus_ratio:.6f},{avg_kernel_attract_ratio:.6f},{avg_target_ring_average_ratio:.6f},{avg_spatial_focus_ratio:.6f},{current_score:.6f},{scheduler_metric_value:.6f},{best_model_metric_value:.6f}\n")
+                f.write(f"{epoch + 1},{avg_train_loss:.6f},{avg_test_loss:.6f},{train_acc:.6f},{test_acc:.6f},{current_lr:.2e}\n")
             
             # Write to log file
             with open(log_file_path, "a") as f:
-                active_intensity_weight = (
-                    current_epoch_global_concentration_weight
-                    if score_intensity_source in ('global_concentration', 'physical_focus', 'spatial_focus')
-                    else current_epoch_detector_competition_weight
-                )
-                f.write(f"{epoch+1:5d} | {avg_train_loss:10.6f} | {train_acc:9.4f} | {avg_test_loss:8.6f} | {test_acc:7.4f} | {current_lr:.2e} | {avg_target_intensity_ratio:7.4f} | {active_intensity_weight:7.4f} | {epoch_time:7.2f} | {status_msg}\n")
+                f.write(f"{epoch+1:5d} | {avg_train_loss:10.6f} | {train_acc:9.4f} | {avg_test_loss:8.6f} | {test_acc:7.4f} | {current_lr:.2e} | {avg_target_intensity_ratio:7.4f} | {current_epoch_spatial_weight:7.4f} | {epoch_time:7.2f} | {status_msg}\n")
             
             # Plotting - move to a background thread to prevent blocking the next epoch
             import threading
@@ -1647,14 +1033,10 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         with open(log_file_path, "a") as f:
             f.write("-" * 80 + "\n")
             f.write(f"Total training time: {elapsed_time:.2f} seconds\n")
-            f.write(f"Best Validation Accuracy: {best_acc:.6f}\n")
-            f.write(f"Best Validation Loss: {best_val_loss:.6f}\n")
-            f.write(f"Validation Accuracy At Best Score: {best_score_acc:.6f}\n")
+            f.write(f"Best Validation Accuracy (associated with best score): {best_acc_for_log:.6f}\n")
             f.write(f"Best Score: {best_score:.6f}\n")
-            f.write(f"Best Model Metric: {best_model_metric}\n")
-            f.write(f"Scheduler Metric: {scheduler_metric_name}\n")
         
-    return elapsed_time, save_dir
+    return elapsed_time
 
 import io
 from PIL import Image
@@ -1863,12 +1245,43 @@ def main():
         v2.Grayscale(num_output_channels=1),
     ])
 
-    gpu_transform_train_list, gpu_transform_val, physical_transform_intensity, visual_transform_intensity, physical_input_noise_std = build_gpu_transforms(
-        config,
-        IMG_SIZE,
-        PADDINGx,
-        PADDINGy
-    )
+    # Read transform intensity from config, default to 1.0
+    transform_intensity = config.get('transform_intensity', 1.0)
+
+    # Build transform list conditionally
+    gpu_transform_train_list = [
+        v2.Resize((IMG_SIZE[0], IMG_SIZE[1]), antialias=True)
+    ]
+
+    gpu_transform_val = v2.Compose([
+        v2.Resize((IMG_SIZE[0], IMG_SIZE[1]), antialias=True)
+    ])
+
+    if transform_intensity > 0:
+        base_rotation = 1
+        base_translate = 0.03
+        base_scale_range = 0.03
+        base_jitter = 0.4
+        base_perspective_scale = 0.2
+        base_perspective_p = 0.3
+        base_sharpness_factor = 2.0
+        base_sharpness_p = 0.5
+        
+        gpu_transform_train_list.extend([
+            v2.RandomRotation(degrees=base_rotation * transform_intensity),
+            v2.RandomAffine(
+                degrees=0, 
+                translate=(base_translate * transform_intensity, base_translate * transform_intensity),
+                scale=(1.0 - base_scale_range * transform_intensity, 1.0 + base_scale_range * transform_intensity), 
+                shear=None
+            ),
+            v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]),
+            v2.ColorJitter(brightness=base_jitter * transform_intensity, contrast=base_jitter * transform_intensity),
+            v2.RandomPerspective(distortion_scale=min(1.0, base_perspective_scale * transform_intensity), p=min(1.0, base_perspective_p * transform_intensity)),
+            v2.RandomAdjustSharpness(sharpness_factor=1.0 + (base_sharpness_factor - 1.0) * transform_intensity, p=min(1.0, base_sharpness_p * transform_intensity)),
+        ])
+    else:
+        gpu_transform_train_list.append(v2.Pad([PADDINGx, PADDINGx, PADDINGy, PADDINGy]))
 
     gpu_transform = v2.Compose(gpu_transform_train_list)
 
@@ -1996,15 +1409,8 @@ def main():
         lr = config.get('learning_rate', 0.001)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         
-        scheduler_metric = config.get('scheduler_metric', 'val_acc')
-        if scheduler_metric == 'acc':
-            scheduler_metric = 'val_acc'
-        elif scheduler_metric == 'loss':
-            scheduler_metric = 'val_loss'
-        elif scheduler_metric == 'score':
-            scheduler_metric = 'composite_score'
-
-        scheduler_mode = 'max' if scheduler_metric in ('val_acc', 'composite_score') else 'min'
+        scheduler_metric = config.get('scheduler_metric', 'acc')
+        scheduler_mode = 'max' if scheduler_metric == 'acc' else 'min'
         scheduler_patience = config.get('scheduler_patience', 4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode=scheduler_mode, factor=0.5, patience=scheduler_patience)
         
@@ -2014,15 +1420,33 @@ def main():
         strict_accuracy_ratio = config.get('strict_accuracy_ratio', 1)
         minus_mask_ratio = config.get('minus_mask_ratio', 0)
         
-        time_1, target_save_dir = train(model, criterion, optimizer, scheduler, train_dataloader, val_dataloader, 
-                                        num_classes=num_classes, epochs=epochs, 
-                                        strict_accuracy_ratio=strict_accuracy_ratio,
-                                        minus_mask_ratio=minus_mask_ratio,
-                                        label_num=label_num,
-                                        exp_name=exp_name)
+        time_1 = train(model, criterion, optimizer, scheduler, train_dataloader, val_dataloader, 
+                       num_classes=num_classes, epochs=epochs, 
+                       strict_accuracy_ratio=strict_accuracy_ratio,
+                       minus_mask_ratio=minus_mask_ratio,
+                       label_num=label_num,
+                       exp_name=exp_name)
         
         if local_rank == 0:
             print(f"Time taken (1 epoch): {time_1:.2f}s")
+
+            # Use the global save_dir initialized in train function.
+            # We need to construct it here since we are in __main__ and time_1 only returns elapsed time.
+            # The best way is to fetch the latest created folder that matches exp_name
+            results_dir_final = config.get('results_dir', 'results')
+            if not os.path.isabs(results_dir_final):
+                results_dir_final = os.path.join(BASE_DIR, results_dir_final)
+                
+            import glob
+            # Find the specific experiment directory just created
+            possible_dirs = glob.glob(os.path.join(results_dir_final, f"{exp_name}_*"))
+            if possible_dirs:
+                possible_dirs.sort(key=os.path.getmtime, reverse=True)
+                target_save_dir = possible_dirs[0]
+            else:
+                # Fallback to results_dir root if we can't find the specific one
+                target_save_dir = results_dir_final
+                
             debug_log_path = os.path.join(target_save_dir, 'debug.log')
             
             # Setup global debug.log redirection if not in a terminal
@@ -2055,7 +1479,7 @@ def main():
                     if debug_eval:
                         print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluation inline...")
                         # Pass the already loaded val_dataset to save RAM and time
-                        eval_module.evaluate(custom_val_dataset=val_dataset, result_dir_override=target_save_dir)
+                        eval_module.evaluate(custom_val_dataset=val_dataset)
                     else:
                         print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running evaluation inline (silent mode)...")
                         # Temporarily redirect stdout to log file
@@ -2063,7 +1487,7 @@ def main():
                             original_stdout = sys.stdout
                             sys.stdout = f_log
                             try:
-                                eval_module.evaluate(custom_val_dataset=val_dataset, result_dir_override=target_save_dir)
+                                eval_module.evaluate(custom_val_dataset=val_dataset)
                             finally:
                                 sys.stdout = original_stdout
                         print("Evaluation completed successfully.")
