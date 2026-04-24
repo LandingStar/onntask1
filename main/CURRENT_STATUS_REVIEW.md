@@ -5,6 +5,13 @@
 - Actual run behavior must be judged from `results/<run>/config.json`, `training_log.txt`, and `metrics.csv`.
 - Files under `test/` or `batch_config/` are only templates. If they are edited later, they may no longer match the run that already happened.
 - Recent experiments showed this clearly: a config intended as a short phase-2 run was actually saved with `epochs = 256` and `learning_rate = 1e-3` in the run directory. Always trust the saved run config.
+- `train.py` now has a code fingerprint guard through `train_code_fingerprint`.
+- If a config stores a non-empty fingerprint, `train.py` / `batch_train.py` verify it against the current `train.py` file content and skip mismatched runs with a warning.
+- Current `train.py` fingerprint: `25c432a31358`.
+- Operational rule:
+  - every time `train.py` changes, recompute the fingerprint
+  - update `train_code_fingerprint` in every config that is still intended to run
+  - otherwise the config should be treated as stale on purpose
 
 ## 2. Current Effective Training Chain
 

@@ -1,5 +1,6 @@
 {
-    "_comment_usage": "Phase-2 follow-up. Test whether a wider continuous attraction basin works better than the current attract-only setting by giving energy a broader gradient path into the detector.",
+    "_comment_usage": "Phase-2 follow-up. Add an inner-core reward on top of soft-inside to test whether energy can be pulled not just across the boundary, but further toward the detector center.",
+    "train_code_fingerprint": "02a4adb9d557",
     "batch_size": 256,
     "epochs": 100,
     "learning_rate": 0.001,
@@ -18,8 +19,7 @@
     "global_energy_concentration_loss_weight": 160.0,
     "global_energy_concentration_target_ratio": 0.15,
     "global_concentration_start_acc": 0.95,
-    "score_intensity_source": "spatial_focus",
-    "score_intensity_cap": 0.3,
+    "score_intensity_source": "soft_inside_core_focus",
     "score_use_soft_intensity": true,
     "score_intensity_reference": 0.12,
     "score_acc_gate": 0.995,
@@ -42,17 +42,19 @@
     "physical_input_noise_std": 0.005,
     "visual_transform_intensity": 0.0,
     "detector_competition_loss_mode": "legacy_relu_helper",
-    "global_physical_objective_mode": "target_attract_ring",
-    "global_attract_reward_weight": 1.0,
-    "global_outer_ring_penalty_weight": 0.0,
-    "global_attract_sigma_ratio": 0.8,
-    "global_attract_extent_ratio": 1.25,
-    "global_outer_ring_width_ratio": 0.2,
+    "global_physical_objective_mode": "target_soft_inside_core",
+    "global_soft_inside_reward_weight": 1.0,
+    "global_inner_core_reward_weight": 0.5,
+    "global_outer_halo_penalty_weight": 0.0,
+    "global_soft_inside_tau_ratio": 0.08,
+    "global_inner_core_ratio": 0.45,
+    "global_outer_halo_width_ratio": 0.3,
+    "score_inner_core_reward_weight": 0.5,
+    "score_outer_halo_penalty_weight": 0.0,
     "global_concentration_hold_epochs": 20,
     "detector_competition_decay_after_global": true,
     "detector_competition_decay_epochs": 12,
     "detector_competition_decay_floor_ratio": 0.1,
-    "score_ring_penalty_weight": 0.0,
     "img_size": [
         1000,
         1000
@@ -92,7 +94,7 @@
     "auto_spatial_mask_target_ratio": 50.0,
     "use_global_energy_ratio": false,
     "save_csv_logs": false,
-    "exp_name": "floating_5det_one_phase2_jitter005_attract_only_wider_basin",
+    "exp_name": "floating_5det_one_phase2_jitter005_soft_inside_core",
     "detector_pos": [
         [
             600.0,
@@ -115,6 +117,5 @@
             600.0
         ]
     ],
-    "batch_train": false,
-    "train_code_fingerprint": "02a4adb9d557"
+    "batch_train": false
 }

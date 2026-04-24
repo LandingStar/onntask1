@@ -22,9 +22,13 @@ from tqdm import tqdm
 import json
 import sys
 import hashlib
+import contextlib
 
 
 TRAIN_CODE_FINGERPRINT_KEY = 'train_code_fingerprint'
+TRAIN_BOOST_FINGERPRINT_KEY = 'train_boost_code_fingerprint'
+SCRIPT_NAME = os.path.basename(__file__)
+BOOST_RUNTIME = {}
 
 
 def compute_train_code_fingerprint():
@@ -32,37 +36,156 @@ def compute_train_code_fingerprint():
         return hashlib.sha256(f.read()).hexdigest()[:12]
 
 
-def parse_float_threshold_list(raw_value):
-    if raw_value is None:
-        return []
-    if isinstance(raw_value, str):
-        candidates = [part.strip() for part in raw_value.split(',')]
-    elif isinstance(raw_value, (list, tuple)):
-        candidates = raw_value
-    else:
-        candidates = [raw_value]
-
-    parsed = []
-    for candidate in candidates:
-        if candidate in (None, ''):
-            continue
-        try:
-            parsed.append(min(max(float(candidate), 0.0), 1.0))
-        except (TypeError, ValueError):
-            continue
-    return sorted(set(parsed), reverse=True)
-
-
-def format_acc_threshold_tag(threshold):
-    return f"{threshold:.4f}".replace('.', 'p')
-
-
 def validate_train_code_fingerprint(config_obj):
-    expected = str(config_obj.get(TRAIN_CODE_FINGERPRINT_KEY, '')).strip()
     actual = compute_train_code_fingerprint()
-    if not expected:
-        return True, expected, actual
-    return expected == actual, expected, actual
+    boost_expected = str(config_obj.get(TRAIN_BOOST_FINGERPRINT_KEY, '')).strip()
+    legacy_expected = str(config_obj.get(TRAIN_CODE_FINGERPRINT_KEY, '')).strip()
+
+    if boost_expected:
+        return boost_expected == actual, boost_expected, actual, TRAIN_BOOST_FINGERPRINT_KEY
+
+    # `train_boost.py` is an experimental sidecar entrypoint.
+    # Requiring `train_code_fingerprint` here would make every existing config fail
+    # unless it was updated specifically for this file, so we only enforce the
+    # dedicated boost fingerprint when it is present.
+    if SCRIPT_NAME != 'train.py':
+        return True, '', actual, TRAIN_BOOST_FINGERPRINT_KEY
+
+    if not legacy_expected:
+        return True, legacy_expected, actual, TRAIN_CODE_FINGERPRINT_KEY
+    return legacy_expected == actual, legacy_expected, actual, TRAIN_CODE_FINGERPRINT_KEY
+
+
+def _get_amp_dtype(config_obj):
+    requested_dtype = str(config_obj.get('boost_amp_dtype', 'auto')).strip().lower()
+    if requested_dtype == 'auto':
+        if torch.cuda.is_available() and hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
+            requested_dtype = 'bfloat16'
+        else:
+            requested_dtype = 'float16'
+
+    if requested_dtype in ('bf16', 'bfloat16'):
+        return torch.bfloat16, 'bfloat16'
+    return torch.float16, 'float16'
+
+
+def build_boost_runtime(config_obj, device_obj):
+    use_cuda = device_obj.type == 'cuda'
+    amp_dtype, amp_dtype_name = _get_amp_dtype(config_obj)
+    amp_requested = bool(config_obj.get('boost_enable_amp', use_cuda))
+    use_amp = use_cuda and amp_requested
+    use_scaler = use_amp and amp_dtype == torch.float16
+
+    runtime = {
+        'use_amp': use_amp,
+        'amp_dtype': amp_dtype,
+        'amp_dtype_name': amp_dtype_name,
+        'use_scaler': use_scaler,
+        'use_tf32': use_cuda and bool(config_obj.get('boost_enable_tf32', True)),
+        'use_cudnn_benchmark': use_cuda and bool(config_obj.get('boost_enable_cudnn_benchmark', True)),
+        'use_compile': bool(config_obj.get('boost_enable_compile', False)),
+        'compile_mode': str(config_obj.get('boost_compile_mode', 'default')),
+        'compile_dynamic': bool(config_obj.get('boost_compile_dynamic', False)),
+        'compile_allow_complex': bool(config_obj.get('boost_compile_allow_complex', False)),
+        'optimizer_set_to_none': bool(config_obj.get('boost_optimizer_set_to_none', True)),
+        'compile_requested': bool(config_obj.get('boost_enable_compile', False)),
+        'profile_steps': bool(config_obj.get('boost_profile_steps', False)),
+        'profile_max_batches': max(0, int(config_obj.get('boost_profile_max_batches', 10))),
+        'profile_warmup_batches': max(0, int(config_obj.get('boost_profile_warmup_batches', 2))),
+    }
+    return runtime
+
+
+def configure_torch_runtime(runtime):
+    if not torch.cuda.is_available():
+        return
+
+    torch.backends.cuda.matmul.allow_tf32 = runtime.get('use_tf32', False)
+    torch.backends.cudnn.allow_tf32 = runtime.get('use_tf32', False)
+    torch.backends.cudnn.benchmark = runtime.get('use_cudnn_benchmark', False)
+
+    if runtime.get('use_tf32', False) and hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision('high')
+
+
+def create_grad_scaler(runtime):
+    enabled = runtime.get('use_scaler', False)
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+        return torch.amp.GradScaler('cuda', enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def autocast_context(runtime):
+    if not runtime.get('use_amp', False):
+        return contextlib.nullcontext()
+    return torch.autocast(device_type='cuda', dtype=runtime['amp_dtype'])
+
+
+def synchronize_for_timing(device_obj):
+    if device_obj.type == 'cuda':
+        torch.cuda.synchronize(device_obj)
+
+
+def make_profile_accumulator():
+    return {
+        'batch_gap': 0.0,
+        'h2d': 0.0,
+        'augment': 0.0,
+        'pad': 0.0,
+        'forward': 0.0,
+        'forward_misalignment': 0.0,
+        'forward_fft': 0.0,
+        'forward_detector': 0.0,
+        'loss': 0.0,
+        'backward': 0.0,
+        'metrics': 0.0,
+        'batches': 0,
+    }
+
+
+def print_profile_summary(prefix, profile):
+    batches = int(profile.get('batches', 0))
+    if batches <= 0:
+        return
+
+    segment_order = ['batch_gap', 'h2d', 'augment', 'pad', 'forward', 'loss', 'backward', 'metrics']
+    measured_total = sum(profile[name] for name in segment_order)
+    measured_total = max(measured_total, 1e-12)
+    print(f"{prefix} ({batches} profiled batch(es)):")
+    for name in segment_order:
+        avg_ms = (profile[name] / batches) * 1000.0
+        share = (profile[name] / measured_total) * 100.0
+        print(f"  {name:10s}: {avg_ms:7.2f} ms/batch ({share:5.1f}%)")
+    forward_total = max(profile.get('forward', 0.0), 1e-12)
+    sub_segments = ['forward_misalignment', 'forward_fft', 'forward_detector']
+    sub_measured_total = sum(profile.get(name, 0.0) for name in sub_segments)
+    if sub_measured_total > 0.0:
+        print(f"{prefix} Forward Breakdown:")
+        for name in sub_segments:
+            avg_ms = (profile.get(name, 0.0) / batches) * 1000.0
+            share = (profile.get(name, 0.0) / forward_total) * 100.0
+            print(f"  {name:20s}: {avg_ms:7.2f} ms/batch ({share:5.1f}% of forward)")
+
+
+def get_active_profile(runtime=None):
+    runtime = runtime or BOOST_RUNTIME
+    if not isinstance(runtime, dict):
+        return None
+    return runtime.get('_active_profile')
+
+
+def start_profile_timer(profile, device_obj):
+    if profile is None:
+        return None
+    synchronize_for_timing(device_obj)
+    return time.perf_counter()
+
+
+def stop_profile_timer(profile, key, start_time, device_obj):
+    if profile is None or start_time is None:
+        return
+    synchronize_for_timing(device_obj)
+    profile[key] = profile.get(key, 0.0) + (time.perf_counter() - start_time)
 
 
 class AdditiveGaussianNoise(torch.nn.Module):
@@ -170,7 +293,7 @@ is_imported = __name__ != "__main__"
 
 # Parse command line arguments
 if not is_imported:
-    print(f"\n[INIT] train.py launched with args: {sys.argv}")
+    print(f"\n[INIT] {SCRIPT_NAME} launched with args: {sys.argv}")
 
 for arg in sys.argv[1:]:
     if arg == "--is-subprocess":
@@ -197,13 +320,13 @@ else:
         print(f"[INIT] Config not found at {config_path}, using defaults")
 
 if not is_imported:
-    fingerprint_ok, expected_fingerprint, actual_fingerprint = validate_train_code_fingerprint(config)
+    fingerprint_ok, expected_fingerprint, actual_fingerprint, fingerprint_key = validate_train_code_fingerprint(config)
     if expected_fingerprint:
-        print(f"[INIT] train.py fingerprint: {actual_fingerprint}")
+        print(f"[INIT] {SCRIPT_NAME} fingerprint: {actual_fingerprint} ({fingerprint_key})")
     if not fingerprint_ok:
         print(
-            f"[WARNING] Config fingerprint mismatch. Expected {expected_fingerprint}, "
-            f"but current train.py fingerprint is {actual_fingerprint}. Skipping run."
+            f"[WARNING] Config fingerprint mismatch for {fingerprint_key}. Expected {expected_fingerprint}, "
+            f"but current {SCRIPT_NAME} fingerprint is {actual_fingerprint}. Skipping run."
         )
         sys.exit(0)
 
@@ -215,7 +338,15 @@ if config.get('batch_train', False) and not is_subprocess and "LOCAL_RANK" not i
     import subprocess
     try:
         # Run batch_train.py in the same directory
-        result = subprocess.run([sys.executable, os.path.join(BASE_DIR, 'batch_train.py')], check=False)
+        result = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(BASE_DIR, 'batch_train.py'),
+                '--train-script',
+                os.path.abspath(__file__)
+            ],
+            check=False
+        )
         sys.exit(result.returncode)
     except Exception as e:
         print(f"Batch training execution failed: {e}")
@@ -381,6 +512,8 @@ else:
         detector_pos_xy.append(((x0+x1)/2, (y0+y1)/2))
 
 def detector_region(Int, detector_mask=None, detector_minus=None, detector_pos=None, detector_size=60):
+    active_profile = get_active_profile()
+    timer_start = start_profile_timer(active_profile, device)
     num_det = len(detector_pos)
     batch_size = Int.shape[0]
     detectors_list = torch.zeros(batch_size, num_det, device=device)
@@ -491,6 +624,7 @@ def detector_region(Int, detector_mask=None, detector_minus=None, detector_pos=N
     # Wait, instead of calculating global energy inside `compute_loss` and re-integrating, 
     # we can append the raw `detectors_list` to the penalty tensor, or return it as a 4th output.
     # To keep it simple and strictly non-breaking, we just return the original tuple.
+    stop_profile_timer(active_profile, 'forward_detector', timer_start, device)
     return Int, detectors_list / total_det_energy, penalty_per_det, detectors_list
 
 # DNN Model
@@ -571,7 +705,9 @@ class DNN(torch.nn.Module):
     def apply_misalignment(self, E):
         if not self.training or not self.simulate_misalignment:
             return E
-            
+        
+        active_profile = get_active_profile()
+        timer_start = start_profile_timer(active_profile, device)
         batch_size = E.shape[0]
         
         # Handle shape differences: E could be [B, H, W] or [B, C, H, W]
@@ -635,7 +771,8 @@ class DNN(torch.nn.Module):
                 
             tilt_phasor = torch.exp(1j * phase_gradient)
             E_out = E_out * tilt_phasor
-            
+        
+        stop_profile_timer(active_profile, 'forward_misalignment', timer_start, device)
         return E_out
 
     def forward(self, E):
@@ -650,16 +787,21 @@ class DNN(torch.nn.Module):
                 current_detector_pos = self.detector_pos + noise
 
         E = E.to(torch.cfloat)
+        active_profile = get_active_profile()
         for index, layer in enumerate(self.diffractive_layers):
             if index > 0 and self.simulate_misalignment:
                 E = self.apply_misalignment(E)
-                
+            
+            fft_timer_start = start_profile_timer(active_profile, device)
             temp = layer(E)
             phase_values = 2 * torch.pi * self.phase_mask[index]
             modulation = torch.exp(1j * phase_values)
             E = temp * modulation
+            stop_profile_timer(active_profile, 'forward_fft', fft_timer_start, device)
+        fft_timer_start = start_profile_timer(active_profile, device)
         E = self.last_diffractive_layer(E)
         Int = torch.abs(E)**2
+        stop_profile_timer(active_profile, 'forward_fft', fft_timer_start, device)
         Int, output, edge_loss, raw_detectors_list = detector_region(Int, self.detector_mask, self.detector_minus, current_detector_pos)
         return output, Int, edge_loss, raw_detectors_list
 
@@ -698,11 +840,16 @@ def plot_loss_acc(train_loss, val_loss, train_acc, val_acc, save_path):
 # Training Function
 def train(model, loss_function, optimizer, scheduler, trainloader, testloader, 
           num_classes=5, epochs=5, device=device, strict_accuracy_ratio=1, 
-          minus_mask_ratio=0, label_num=20, exp_name="default"):
+          minus_mask_ratio=0, label_num=20, exp_name="default", boost_runtime=None):
     
     currentDate = time.strftime("%Y%m%d_%H%M", time.localtime())
     is_main_process = not dist.is_initialized() or dist.get_rank() == 0
     model_to_save = model.module if isinstance(model, DDP) else model
+    boost_runtime = boost_runtime or {}
+    grad_scaler = boost_runtime.get('grad_scaler')
+    profile_enabled = bool(boost_runtime.get('profile_steps', False))
+    profile_max_batches = int(boost_runtime.get('profile_max_batches', 0))
+    profile_warmup_batches = int(boost_runtime.get('profile_warmup_batches', 0))
     
     # Save Dir Logic
     results_dir = config.get('results_dir', 'results')
@@ -723,7 +870,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         # Setup CSV logger for metrics
         metrics_csv_path = os.path.join(save_dir, 'metrics.csv')
         with open(metrics_csv_path, 'w') as f:
-            f.write("epoch,train_loss,val_loss,train_acc,val_acc,learning_rate,train_primary_loss,val_primary_loss,train_loss_vec,val_loss_vec,train_detector_competition_loss,val_detector_competition_loss,train_global_concentration_loss,val_global_concentration_loss,train_target_penalty,val_target_penalty,avg_detector_competition_ratio,avg_global_concentration_ratio,avg_outside_average_ratio,avg_physical_focus_ratio,avg_kernel_attract_ratio,avg_target_ring_average_ratio,avg_spatial_focus_ratio,avg_soft_inside_ratio,avg_inner_core_average_ratio,avg_outer_halo_average_ratio,avg_soft_inside_core_focus_ratio,avg_inner_edge_average_ratio,avg_outer_edge_average_ratio,avg_inside_core_edge_focus_ratio,avg_inside_core_outside_focus_ratio,composite_score,scheduler_metric_value,best_model_metric_value\n")
+            f.write("epoch,train_loss,val_loss,train_acc,val_acc,learning_rate,train_primary_loss,val_primary_loss,train_loss_vec,val_loss_vec,train_detector_competition_loss,val_detector_competition_loss,train_global_concentration_loss,val_global_concentration_loss,train_target_penalty,val_target_penalty,avg_detector_competition_ratio,avg_global_concentration_ratio,avg_outside_average_ratio,avg_physical_focus_ratio,avg_kernel_attract_ratio,avg_target_ring_average_ratio,avg_spatial_focus_ratio,avg_soft_inside_ratio,avg_inner_core_average_ratio,avg_outer_halo_average_ratio,avg_soft_inside_core_focus_ratio,avg_inside_core_outside_focus_ratio,composite_score,scheduler_metric_value,best_model_metric_value\n")
     
     train_loss_hist = []
     test_loss_hist = []
@@ -733,9 +880,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     best_acc = -float('inf')
     best_val_loss = float('inf')
     best_score_acc = 0.0
-    best_acc_epoch = 0
-    best_val_loss_epoch = 0
-    best_score_epoch = 0
 
     def normalize_metric_name(metric_name, default_value):
         value = config.get(metric_name, default_value)
@@ -795,10 +939,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     global_soft_inside_tau_ratio = float(config.get('global_soft_inside_tau_ratio', 0.08))
     global_inner_core_ratio = float(config.get('global_inner_core_ratio', 0.45))
     global_outer_halo_width_ratio = float(config.get('global_outer_halo_width_ratio', 0.30))
-    global_inner_edge_penalty_weight = float(config.get('global_inner_edge_penalty_weight', 0.0))
-    global_outer_edge_penalty_weight = float(config.get('global_outer_edge_penalty_weight', 0.0))
-    global_inner_edge_width_ratio = float(config.get('global_inner_edge_width_ratio', 0.18))
-    global_outer_edge_width_ratio = float(config.get('global_outer_edge_width_ratio', 0.18))
     score_inside_reward_weight = float(
         config.get('score_inside_reward_weight', global_inside_reward_weight)
     )
@@ -814,12 +954,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     score_outer_halo_penalty_weight = float(
         config.get('score_outer_halo_penalty_weight', global_outer_halo_penalty_weight)
     )
-    score_inner_edge_penalty_weight = float(
-        config.get('score_inner_edge_penalty_weight', global_inner_edge_penalty_weight)
-    )
-    score_outer_edge_penalty_weight = float(
-        config.get('score_outer_edge_penalty_weight', global_outer_edge_penalty_weight)
-    )
 
     score_intensity_source = config.get(
         'score_intensity_source',
@@ -828,30 +962,18 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     score_use_soft_intensity = bool(
         config.get(
             'score_use_soft_intensity',
-            score_intensity_source in ('spatial_focus', 'soft_inside_core_focus', 'inside_core_edge_focus', 'inside_core_outside_focus')
+            score_intensity_source in ('spatial_focus', 'soft_inside_core_focus', 'inside_core_outside_focus')
         )
     )
     score_acc_gate = float(
         config.get('score_acc_gate', 0.995 if score_intensity_source == 'spatial_focus' else 0.0)
     )
-    score_acc_cap = float(config.get('score_acc_cap', 0.97))
-    score_acc_floor = float(config.get('score_acc_floor', 0.0))
-    score_min_acc_for_selection = float(
-        config.get('score_min_acc_for_selection', score_acc_floor)
-    )
-    score_tiered_save_min_accs = parse_float_threshold_list(
-        config.get('score_tiered_save_min_accs', [])
-    )
     score_acc_gate_width = max(
         float(config.get('score_acc_gate_width', 0.005)),
         1e-8
     )
-    score_physical_transition_width = max(
-        float(config.get('score_physical_transition_width', 0.10)),
-        1e-8
-    )
     default_score_reference = (
-        0.12 if score_intensity_source in ('spatial_focus', 'soft_inside_core_focus', 'inside_core_edge_focus', 'inside_core_outside_focus')
+        0.12 if score_intensity_source in ('spatial_focus', 'soft_inside_core_focus', 'inside_core_outside_focus')
         else (
             global_energy_concentration_target_ratio
             if score_intensity_source in ('global_concentration', 'physical_focus')
@@ -874,61 +996,10 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     detector_competition_decay_floor_ratio = float(
         config.get('detector_competition_decay_floor_ratio', 1.0)
     )
-    classification_loss_relax_enabled = bool(config.get('classification_loss_relax_enabled', True))
-    classification_loss_relax_acc_threshold = float(
-        config.get('classification_loss_relax_acc_threshold', 0.97)
-    )
-    classification_loss_relax_floor_ratio = float(
-        config.get('classification_loss_relax_floor_ratio', 0.2)
-    )
-    classification_loss_relax_transition_width = max(
-        float(
-            config.get(
-                'classification_loss_relax_transition_width',
-                max(1.0 - classification_loss_relax_acc_threshold, 1e-8)
-            )
-        ),
-        1e-8
-    )
-    classification_loss_relax_hold_epochs = max(
-        0,
-        int(config.get('classification_loss_relax_hold_epochs', 0))
-    )
-    detector_competition_relax_hold_epochs = max(
-        0,
-        int(config.get('detector_competition_relax_hold_epochs', 0))
-    )
-    detector_competition_relax_acc_threshold = float(
-        config.get(
-            'detector_competition_relax_acc_threshold',
-            classification_loss_relax_acc_threshold
-        )
-    )
-    detector_competition_relax_floor_ratio = float(
-        config.get('detector_competition_relax_floor_ratio', 0.0)
-    )
     detector_competition_decay_floor_ratio = max(
         0.0,
         min(detector_competition_decay_floor_ratio, 1.0)
     )
-    detector_competition_relax_floor_ratio = max(
-        0.0,
-        min(detector_competition_relax_floor_ratio, 1.0)
-    )
-    score_acc_floor = min(max(score_acc_floor, 0.0), 1.0)
-    score_min_acc_for_selection = min(max(score_min_acc_for_selection, 0.0), 1.0)
-    tiered_best_scores = {
-        threshold: -float('inf') for threshold in score_tiered_save_min_accs
-    }
-    tiered_best_info = {
-        threshold: {
-            'epoch': 0,
-            'acc': 0.0,
-            'score': -float('inf'),
-            'intensity': 0.0,
-        }
-        for threshold in score_tiered_save_min_accs
-    }
     
     aggressive_intensity_optimization = config.get('aggressive_intensity_optimization', True)
     aggressive_acc_threshold = config.get('aggressive_acc_threshold', 0.99)
@@ -1036,8 +1107,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         soft_inside_ratio = torch.zeros_like(global_energy)
         inner_core_average_ratio = torch.zeros_like(global_energy)
         outer_halo_average_ratio = torch.zeros_like(global_energy)
-        inner_edge_average_ratio = torch.zeros_like(global_energy)
-        outer_edge_average_ratio = torch.zeros_like(global_energy)
 
         attract_sigma = max(det_size_config * global_attract_sigma_ratio, 1.0)
         attract_extent = max(det_size_config * global_attract_extent_ratio, 1.0)
@@ -1045,8 +1114,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         soft_inside_tau = max(det_size_config * global_soft_inside_tau_ratio, 1.0)
         inner_core_radius = max((det_size_config / 2.0) * global_inner_core_ratio, 1.0)
         outer_halo_width = max(det_size_config * global_outer_halo_width_ratio, 1.0)
-        inner_edge_width = max(det_size_config * global_inner_edge_width_ratio, 1.0)
-        outer_edge_width = max(det_size_config * global_outer_edge_width_ratio, 1.0)
 
         for det_idx in range(classes_num):
             batch_mask = (target_det_indices == det_idx)
@@ -1055,7 +1122,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
 
             center_x, center_y = detector_pos_xy[det_idx]
             det_half = det_size_config / 2.0
-            support_half = det_half + max(attract_extent, ring_width, outer_halo_width, outer_edge_width, 3.0 * soft_inside_tau)
+            support_half = det_half + max(attract_extent, ring_width, outer_halo_width, 3.0 * soft_inside_tau)
 
             x_left = max(int(center_x - support_half), 0)
             x_right = min(int(center_x + support_half) + 1, PhaseMask[0])
@@ -1098,14 +1165,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 (inner_core_energy / global_energy[batch_mask]) * (global_area / inner_core_area)
             )
 
-            inner_edge_inner = max(det_half - inner_edge_width, 0.0)
-            inner_edge_mask = ((radius >= inner_edge_inner) & (radius <= det_half)).to(out_img.dtype)
-            inner_edge_area = inner_edge_mask.sum().clamp_min(1e-8)
-            inner_edge_energy = (local_intensity * inner_edge_mask).sum(dim=(1, 2))
-            inner_edge_average_ratio[batch_mask] = (
-                (inner_edge_energy / global_energy[batch_mask]) * (global_area / inner_edge_area)
-            )
-
             ring_inner = det_half
             ring_outer = det_half + ring_width
             ring_mask = ((radius >= ring_inner) & (radius <= ring_outer)).to(out_img.dtype)
@@ -1124,15 +1183,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 (outer_halo_energy / global_energy[batch_mask]) * (global_area / outer_halo_area)
             )
 
-            outer_edge_inner = det_half
-            outer_edge_outer = det_half + outer_edge_width
-            outer_edge_mask = ((radius >= outer_edge_inner) & (radius <= outer_edge_outer)).to(out_img.dtype)
-            outer_edge_area = outer_edge_mask.sum().clamp_min(1e-8)
-            outer_edge_energy = (local_intensity * outer_edge_mask).sum(dim=(1, 2))
-            outer_edge_average_ratio[batch_mask] = (
-                (outer_edge_energy / global_energy[batch_mask]) * (global_area / outer_edge_area)
-            )
-
         spatial_focus_ratio = kernel_attract_ratio - (
             score_ring_penalty_weight * target_ring_average_ratio
         )
@@ -1140,12 +1190,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             soft_inside_ratio
             + score_inner_core_reward_weight * inner_core_average_ratio
             - score_outer_halo_penalty_weight * outer_halo_average_ratio
-        )
-        inside_core_edge_focus_ratio = (
-            score_inside_reward_weight * soft_inside_ratio
-            + score_inner_core_reward_weight * inner_core_average_ratio
-            - score_inner_edge_penalty_weight * inner_edge_average_ratio
-            - score_outer_edge_penalty_weight * outer_edge_average_ratio
         )
         return (
             kernel_attract_ratio,
@@ -1155,9 +1199,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             inner_core_average_ratio,
             outer_halo_average_ratio,
             soft_inside_core_focus_ratio,
-            inner_edge_average_ratio,
-            outer_edge_average_ratio,
-            inside_core_edge_focus_ratio,
         )
 
     def compute_loss(images, labels, out_img, output_vec, raw_detectors,
@@ -1234,10 +1275,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         outside_area_ratio = global_area / outside_area
         outside_energy = torch.clamp(global_energy - target_det_energy, min=0.0)
         outside_average_ratio = (outside_energy / global_energy) * outside_area_ratio
-        outside_improvement_ratio = torch.clamp(
-            outside_area_ratio - outside_average_ratio,
-            min=0.0
-        )
         physical_focus_ratio = global_concentration_ratio - (
             score_outside_penalty_weight * outside_average_ratio
         )
@@ -1249,9 +1286,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             inner_core_average_ratio,
             outer_halo_average_ratio,
             soft_inside_core_focus_ratio,
-            inner_edge_average_ratio,
-            outer_edge_average_ratio,
-            inside_core_edge_focus_ratio,
         ) = compute_target_spatial_metrics(
             out_img,
             base_det
@@ -1259,7 +1293,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         inside_core_outside_focus_ratio = (
             score_inside_reward_weight * global_concentration_ratio
             + score_inner_core_reward_weight * inner_core_average_ratio
-            + score_outside_penalty_weight * outside_improvement_ratio
+            - score_outside_penalty_weight * outside_average_ratio
         )
 
         # Detector-space helper objective.
@@ -1296,22 +1330,11 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         elif global_physical_objective_mode == 'target_inside_core_outside':
             inside_reward = -global_concentration_ratio
             inner_core_reward = -inner_core_average_ratio
-            outside_reward = -outside_improvement_ratio
+            outside_penalty = outside_average_ratio
             global_concentration_loss = (
                 global_inside_reward_weight * inside_reward
                 + global_inner_core_reward_weight * inner_core_reward
-                + global_outside_penalty_weight * outside_reward
-            )
-        elif global_physical_objective_mode == 'target_inside_core_edge':
-            inside_reward = -global_concentration_ratio
-            inner_core_reward = -inner_core_average_ratio
-            inner_edge_penalty = inner_edge_average_ratio
-            outer_edge_penalty = outer_edge_average_ratio
-            global_concentration_loss = (
-                global_inside_reward_weight * inside_reward
-                + global_inner_core_reward_weight * inner_core_reward
-                + global_inner_edge_penalty_weight * inner_edge_penalty
-                + global_outer_edge_penalty_weight * outer_edge_penalty
+                + global_outside_penalty_weight * outside_penalty
             )
         else:
             global_concentration_loss = intensity_margin_loss(
@@ -1339,28 +1362,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         else:
             primary_classification_loss = loss_vec
             effective_detector_competition_weight = current_detector_competition_weight
-
-        if classification_loss_relax_enabled and classification_loss_type != 'competition':
-            threshold = classification_loss_relax_acc_threshold
-            floor_ratio = min(max(classification_loss_relax_floor_ratio, 0.0), 1.0)
-            classification_loss_scale = 1.0
-            if classification_relax_active_for_epoch:
-                classification_loss_scale = floor_ratio
-            else:
-                with torch.no_grad():
-                    batch_acc_value = compute_acc(output_vec, labels).float().mean().item()
-                if threshold < 1.0 and batch_acc_value > threshold:
-                    full_relax_acc = min(
-                        threshold + classification_loss_relax_transition_width,
-                        1.0
-                    )
-                    relax_progress = min(
-                        max((batch_acc_value - threshold) / max(full_relax_acc - threshold, 1e-8), 0.0),
-                        1.0
-                    )
-                    classification_loss_scale = 1.0 - ((1.0 - floor_ratio) * relax_progress)
-            if classification_loss_scale < 1.0:
-                primary_classification_loss = primary_classification_loss * classification_loss_scale
 
         # Composite Loss
         batch_loss = (
@@ -1415,8 +1416,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
     global_hold_remaining_epochs = 0
     detector_competition_decay_started = False
     detector_competition_decay_step = 0
-    classification_relax_hold_remaining_epochs = 0
-    detector_competition_relax_hold_remaining_epochs = 0
 
     for epoch in range(epochs):
         epoch_start_time = time.time()
@@ -1424,6 +1423,8 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         model.train()
         correct = 0
         total = 0
+        train_profile = make_profile_accumulator()
+        prev_train_iter_end = time.perf_counter()
         
         pbar = tqdm(trainloader, desc=f"Epoch {epoch+1}/{epochs}")
         
@@ -1434,12 +1435,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         global_concentration_enabled = False
         previous_epoch_reached_global_threshold = (
             len(test_acc_hist) > 0 and test_acc_hist[-1] >= global_concentration_start_acc
-        )
-        previous_epoch_reached_classification_relax_threshold = (
-            len(test_acc_hist) > 0 and test_acc_hist[-1] >= classification_loss_relax_acc_threshold
-        )
-        previous_epoch_reached_detector_relax_threshold = (
-            len(test_acc_hist) > 0 and test_acc_hist[-1] >= detector_competition_relax_acc_threshold
         )
         if global_concentration_start_acc <= 0:
             global_concentration_enabled = True
@@ -1456,12 +1451,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         if not global_concentration_enabled:
             current_epoch_global_concentration_weight = 0.0
 
-        if classification_loss_relax_hold_epochs > 0 and previous_epoch_reached_classification_relax_threshold:
-            classification_relax_hold_remaining_epochs = classification_loss_relax_hold_epochs
-        classification_relax_active_for_epoch = classification_relax_hold_remaining_epochs > 0
-        if classification_relax_active_for_epoch:
-            classification_relax_hold_remaining_epochs -= 1
-
         if detector_competition_decay_after_global:
             if previous_epoch_reached_global_threshold and not detector_competition_decay_started:
                 detector_competition_decay_started = True
@@ -1477,13 +1466,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 )
                 current_epoch_detector_competition_weight *= current_decay_ratio
                 detector_competition_decay_step += 1
-
-        if detector_competition_relax_hold_epochs > 0 and previous_epoch_reached_detector_relax_threshold:
-            detector_competition_relax_hold_remaining_epochs = detector_competition_relax_hold_epochs
-        detector_relax_active_for_epoch = detector_competition_relax_hold_remaining_epochs > 0
-        if detector_relax_active_for_epoch:
-            current_epoch_detector_competition_weight *= detector_competition_relax_floor_ratio
-            detector_competition_relax_hold_remaining_epochs -= 1
 
         if aggressive_intensity_optimization and epoch > 0:
             # Use previous epoch's test accuracy to decide
@@ -1503,18 +1485,40 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         ep_train_global_conc_sum = 0.0
         ep_train_target_penalty_sum = 0.0
                 
-        for images, labels in pbar:
-            optimizer.zero_grad()
+        for batch_idx, (images, labels) in enumerate(pbar):
+            should_profile = (
+                profile_enabled
+                and batch_idx >= profile_warmup_batches
+                and (profile_max_batches <= 0 or train_profile['batches'] < profile_max_batches)
+            )
+            if should_profile:
+                synchronize_for_timing(device)
+                batch_begin = time.perf_counter()
+                train_profile['batch_gap'] += max(0.0, batch_begin - prev_train_iter_end)
+
+            optimizer.zero_grad(set_to_none=boost_runtime.get('optimizer_set_to_none', False))
             
             # Asynchronous data transfer to GPU (overlap compute & transfer)
+            if should_profile:
+                synchronize_for_timing(device)
+                t_seg = time.perf_counter()
             images = images.to(device, non_blocking=True).float()
             labels = labels.to(device, non_blocking=True)
+            if should_profile:
+                synchronize_for_timing(device)
+                train_profile['h2d'] += time.perf_counter() - t_seg
             
+            if should_profile:
+                synchronize_for_timing(device)
+                t_seg = time.perf_counter()
             with torch.no_grad():
                 if gpu_transform:
                     images_aug = gpu_transform(images)
                 else:
                     images_aug = images
+            if should_profile:
+                synchronize_for_timing(device)
+                train_profile['augment'] += time.perf_counter() - t_seg
             
             if images_aug.shape[1] == 1:
                 images_squeezed = images_aug.squeeze(1)
@@ -1526,38 +1530,75 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             # gpu_transform adds 100 padding.
             # If input is 1000, output is 1200.
             # Apply padding (can also be done async if using appropriate padding module)
+            if should_profile:
+                synchronize_for_timing(device)
+                t_seg = time.perf_counter()
             if images_squeezed.shape[-1] == PhaseMask[0]:
                  images_input = images_squeezed
             else:
                  images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
+            if should_profile:
+                synchronize_for_timing(device)
+                train_profile['pad'] += time.perf_counter() - t_seg
             
-            out_label, out_img, penalty_per_det, raw_detectors = model(images_input)
-            
-            loss, component_stats, _ = compute_loss(
-                images_input,
-                labels,
-                out_img,
-                out_label,
-                raw_detectors,
-                current_epoch_detector_competition_weight,
-                current_epoch_global_concentration_weight,
-                is_aggressive
-            )
-            # Only penalize target detectors (not all detectors)
-            target_det = labels // 4
-            target_penalty = penalty_per_det[torch.arange(len(labels), device=device), target_det]
-            loss += target_penalty.sum()
+            with autocast_context(boost_runtime):
+                if should_profile:
+                    synchronize_for_timing(device)
+                    t_seg = time.perf_counter()
+                    boost_runtime['_active_profile'] = train_profile
+                out_label, out_img, penalty_per_det, raw_detectors = model(images_input)
+                boost_runtime['_active_profile'] = None
+                if should_profile:
+                    synchronize_for_timing(device)
+                    train_profile['forward'] += time.perf_counter() - t_seg
+                
+                if should_profile:
+                    synchronize_for_timing(device)
+                    t_seg = time.perf_counter()
+                loss, component_stats, _ = compute_loss(
+                    images_input,
+                    labels,
+                    out_img,
+                    out_label,
+                    raw_detectors,
+                    current_epoch_detector_competition_weight,
+                    current_epoch_global_concentration_weight,
+                    is_aggressive
+                )
+                # Only penalize target detectors (not all detectors)
+                target_det = labels // 4
+                target_penalty = penalty_per_det[torch.arange(len(labels), device=device), target_det]
+                loss += target_penalty.sum()
+                if should_profile:
+                    synchronize_for_timing(device)
+                    train_profile['loss'] += time.perf_counter() - t_seg
             ep_train_primary_loss_sum += component_stats[0].item()
             ep_train_loss_vec_sum += component_stats[1].item()
             ep_train_detector_comp_sum += component_stats[2].item()
             ep_train_global_conc_sum += component_stats[3].item()
             ep_train_target_penalty_sum += target_penalty.sum().item()
             
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            if should_profile:
+                synchronize_for_timing(device)
+                t_seg = time.perf_counter()
+            if grad_scaler is not None and boost_runtime.get('use_scaler', False):
+                grad_scaler.scale(loss).backward()
+                grad_scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            if should_profile:
+                synchronize_for_timing(device)
+                train_profile['backward'] += time.perf_counter() - t_seg
             ep_train_loss += loss.item()
             
+            if should_profile:
+                synchronize_for_timing(device)
+                t_seg = time.perf_counter()
             with torch.no_grad():
                 batch_correct = compute_acc(out_label, labels).sum().item()
                 current_batch_acc = batch_correct / labels.size(0)
@@ -1575,8 +1616,17 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                     
                 correct += batch_correct
                 total += labels.size(0)
+            if should_profile:
+                synchronize_for_timing(device)
+                train_profile['metrics'] += time.perf_counter() - t_seg
+                train_profile['batches'] += 1
             
             pbar.set_postfix({'loss': loss.item()/labels.size(0), 'acc': batch_correct/labels.size(0)})
+            if should_profile:
+                synchronize_for_timing(device)
+                prev_train_iter_end = time.perf_counter()
+            else:
+                prev_train_iter_end = time.perf_counter()
         
         if dist.is_initialized():
             train_metrics = torch.tensor([
@@ -1614,6 +1664,8 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         model.eval()
         correct = 0
         total = 0
+        val_profile = make_profile_accumulator()
+        prev_val_iter_end = time.perf_counter()
         
         # To track validation intensity metrics
         val_detector_competition_sum = 0.0
@@ -1627,9 +1679,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         val_inner_core_sum = 0.0
         val_outer_halo_sum = 0.0
         val_soft_inside_core_focus_sum = 0.0
-        val_inner_edge_sum = 0.0
-        val_outer_edge_sum = 0.0
-        val_inside_core_edge_focus_sum = 0.0
         val_inside_core_outside_focus_sum = 0.0
         val_primary_loss_sum = 0.0
         val_loss_vec_sum = 0.0
@@ -1638,42 +1687,84 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         val_target_penalty_sum = 0.0
         
         with torch.no_grad():
-            for images, labels in testloader:
+            for batch_idx, (images, labels) in enumerate(testloader):
+                should_profile = (
+                    profile_enabled
+                    and batch_idx >= profile_warmup_batches
+                    and (profile_max_batches <= 0 or val_profile['batches'] < profile_max_batches)
+                )
+                if should_profile:
+                    synchronize_for_timing(device)
+                    batch_begin = time.perf_counter()
+                    val_profile['batch_gap'] += max(0.0, batch_begin - prev_val_iter_end)
                 # Asynchronous transfer
+                if should_profile:
+                    synchronize_for_timing(device)
+                    t_seg = time.perf_counter()
                 images = images.to(device, non_blocking=True).float()
                 labels = labels.to(device, non_blocking=True)
+                if should_profile:
+                    synchronize_for_timing(device)
+                    val_profile['h2d'] += time.perf_counter() - t_seg
                 
                 # Apply validation transforms on GPU (Resize)
+                if should_profile:
+                    synchronize_for_timing(device)
+                    t_seg = time.perf_counter()
                 if gpu_transform_val:
                     images_aug = gpu_transform_val(images)
                 else:
                     images_aug = images
+                if should_profile:
+                    synchronize_for_timing(device)
+                    val_profile['augment'] += time.perf_counter() - t_seg
                 
                 if images_aug.shape[1] == 1:
                     images_squeezed = images_aug.squeeze(1)
                 else:
                     images_squeezed = images_aug
                     
+                if should_profile:
+                    synchronize_for_timing(device)
+                    t_seg = time.perf_counter()
                 if images_squeezed.shape[-1] == PhaseMask[0]:
                     images_input = images_squeezed
                 else:
                     images_input = F.pad(images_squeezed, pad=(PADDINGy, PADDINGy, PADDINGx, PADDINGx))
+                if should_profile:
+                    synchronize_for_timing(device)
+                    val_profile['pad'] += time.perf_counter() - t_seg
                     
-                out_label, out_img, penalty_per_det, raw_detectors = model(images_input)
-                
-                loss, component_stats, _ = compute_loss(
-                    images_input,
-                    labels,
-                    out_img,
-                    out_label,
-                    raw_detectors,
-                    current_epoch_detector_competition_weight,
-                    current_epoch_global_concentration_weight,
-                    is_aggressive
-                )
-                target_det = labels // 4
-                target_penalty = penalty_per_det[torch.arange(len(labels), device=device), target_det]
-                loss += target_penalty.sum()
+                with autocast_context(boost_runtime):
+                    if should_profile:
+                        synchronize_for_timing(device)
+                        t_seg = time.perf_counter()
+                        boost_runtime['_active_profile'] = val_profile
+                    out_label, out_img, penalty_per_det, raw_detectors = model(images_input)
+                    boost_runtime['_active_profile'] = None
+                    if should_profile:
+                        synchronize_for_timing(device)
+                        val_profile['forward'] += time.perf_counter() - t_seg
+                    
+                    if should_profile:
+                        synchronize_for_timing(device)
+                        t_seg = time.perf_counter()
+                    loss, component_stats, _ = compute_loss(
+                        images_input,
+                        labels,
+                        out_img,
+                        out_label,
+                        raw_detectors,
+                        current_epoch_detector_competition_weight,
+                        current_epoch_global_concentration_weight,
+                        is_aggressive
+                    )
+                    target_det = labels // 4
+                    target_penalty = penalty_per_det[torch.arange(len(labels), device=device), target_det]
+                    loss += target_penalty.sum()
+                    if should_profile:
+                        synchronize_for_timing(device)
+                        val_profile['loss'] += time.perf_counter() - t_seg
                 ep_test_loss += loss.item()
                 val_primary_loss_sum += component_stats[0].item()
                 val_loss_vec_sum += component_stats[1].item()
@@ -1681,6 +1772,9 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 val_global_conc_loss_sum += component_stats[3].item()
                 val_target_penalty_sum += target_penalty.sum().item()
                 
+                if should_profile:
+                    synchronize_for_timing(device)
+                    t_seg = time.perf_counter()
                 correct += compute_acc(out_label, labels).sum().item()
                 total += labels.size(0)
                 
@@ -1705,10 +1799,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 outside_area_ratio = global_area / outside_area
                 outside_energy = torch.clamp(global_energy - target_det_energy, min=0.0)
                 outside_average_ratio = (outside_energy / global_energy) * outside_area_ratio
-                outside_improvement_ratio = torch.clamp(
-                    outside_area_ratio - outside_average_ratio,
-                    min=0.0
-                )
                 physical_focus_ratio = global_concentration_ratio - (
                     score_outside_penalty_weight * outside_average_ratio
                 )
@@ -1720,9 +1810,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                     inner_core_average_ratio,
                     outer_halo_average_ratio,
                     soft_inside_core_focus_ratio,
-                    inner_edge_average_ratio,
-                    outer_edge_average_ratio,
-                    inside_core_edge_focus_ratio,
                 ) = compute_target_spatial_metrics(
                     out_img,
                     target_det
@@ -1730,7 +1817,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 inside_core_outside_focus_ratio = (
                     score_inside_reward_weight * global_concentration_ratio
                     + score_inner_core_reward_weight * inner_core_average_ratio
-                    + score_outside_penalty_weight * outside_improvement_ratio
+                    - score_outside_penalty_weight * outside_average_ratio
                 )
 
                 val_detector_competition_sum += detector_competition_ratio.sum().item()
@@ -1744,10 +1831,14 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                 val_inner_core_sum += inner_core_average_ratio.sum().item()
                 val_outer_halo_sum += outer_halo_average_ratio.sum().item()
                 val_soft_inside_core_focus_sum += soft_inside_core_focus_ratio.sum().item()
-                val_inner_edge_sum += inner_edge_average_ratio.sum().item()
-                val_outer_edge_sum += outer_edge_average_ratio.sum().item()
-                val_inside_core_edge_focus_sum += inside_core_edge_focus_ratio.sum().item()
                 val_inside_core_outside_focus_sum += inside_core_outside_focus_ratio.sum().item()
+                if should_profile:
+                    synchronize_for_timing(device)
+                    val_profile['metrics'] += time.perf_counter() - t_seg
+                    val_profile['batches'] += 1
+                    prev_val_iter_end = time.perf_counter()
+                else:
+                    prev_val_iter_end = time.perf_counter()
 
         if dist.is_initialized():
             val_metrics = torch.tensor(
@@ -1766,9 +1857,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                     val_inner_core_sum,
                     val_outer_halo_sum,
                     val_soft_inside_core_focus_sum,
-                    val_inner_edge_sum,
-                    val_outer_edge_sum,
-                    val_inside_core_edge_focus_sum,
                     val_inside_core_outside_focus_sum,
                     val_primary_loss_sum,
                     val_loss_vec_sum,
@@ -1794,15 +1882,12 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             val_inner_core_sum = val_metrics[11].item()
             val_outer_halo_sum = val_metrics[12].item()
             val_soft_inside_core_focus_sum = val_metrics[13].item()
-            val_inner_edge_sum = val_metrics[14].item()
-            val_outer_edge_sum = val_metrics[15].item()
-            val_inside_core_edge_focus_sum = val_metrics[16].item()
-            val_inside_core_outside_focus_sum = val_metrics[17].item()
-            val_primary_loss_sum = val_metrics[18].item()
-            val_loss_vec_sum = val_metrics[19].item()
-            val_detector_comp_loss_sum = val_metrics[20].item()
-            val_global_conc_loss_sum = val_metrics[21].item()
-            val_target_penalty_sum = val_metrics[22].item()
+            val_inside_core_outside_focus_sum = val_metrics[14].item()
+            val_primary_loss_sum = val_metrics[15].item()
+            val_loss_vec_sum = val_metrics[16].item()
+            val_detector_comp_loss_sum = val_metrics[17].item()
+            val_global_conc_loss_sum = val_metrics[18].item()
+            val_target_penalty_sum = val_metrics[19].item()
 
         avg_test_loss = ep_test_loss / total if total > 0 else 0
         test_acc = correct / total if total > 0 else 0
@@ -1824,9 +1909,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         avg_inner_core_average_ratio = val_inner_core_sum / total if total > 0 else 0
         avg_outer_halo_average_ratio = val_outer_halo_sum / total if total > 0 else 0
         avg_soft_inside_core_focus_ratio = val_soft_inside_core_focus_sum / total if total > 0 else 0
-        avg_inner_edge_average_ratio = val_inner_edge_sum / total if total > 0 else 0
-        avg_outer_edge_average_ratio = val_outer_edge_sum / total if total > 0 else 0
-        avg_inside_core_edge_focus_ratio = val_inside_core_edge_focus_sum / total if total > 0 else 0
         avg_inside_core_outside_focus_ratio = val_inside_core_outside_focus_sum / total if total > 0 else 0
         if score_intensity_source == 'global_concentration':
             avg_target_intensity_ratio = avg_global_concentration_ratio
@@ -1836,8 +1918,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             avg_target_intensity_ratio = avg_spatial_focus_ratio
         elif score_intensity_source == 'soft_inside_core_focus':
             avg_target_intensity_ratio = avg_soft_inside_core_focus_ratio
-        elif score_intensity_source == 'inside_core_edge_focus':
-            avg_target_intensity_ratio = avg_inside_core_edge_focus_ratio
         elif score_intensity_source == 'inside_core_outside_focus':
             avg_target_intensity_ratio = avg_inside_core_outside_focus_ratio
         else:
@@ -1877,7 +1957,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             # so intensity score cannot dominate while accuracy is still unstable.
             score_intensity_target = (
                 global_energy_concentration_target_ratio
-                if score_intensity_source in ('global_concentration', 'physical_focus', 'spatial_focus', 'soft_inside_core_focus', 'inside_core_edge_focus', 'inside_core_outside_focus')
+                if score_intensity_source in ('global_concentration', 'physical_focus', 'spatial_focus', 'soft_inside_core_focus', 'inside_core_outside_focus')
                 else detector_competition_target_ratio
             )
             if not is_aggressive:
@@ -1886,35 +1966,8 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             else:
                 # During aggressive optimization, remove the cap to encourage endless concentration
                 effective_intensity = avg_target_intensity_ratio
-
-        effective_score_acc = min(test_acc, score_acc_cap) if score_acc_cap > 0 else test_acc
-        if score_min_acc_for_selection > 0.0:
-            if test_acc < score_min_acc_for_selection:
-                current_score = -1e6 + effective_score_acc
-            else:
-                selection_acc_base = (
-                    min(score_min_acc_for_selection, score_acc_cap)
-                    if score_acc_cap > 0
-                    else score_min_acc_for_selection
-                )
-                current_score = (
-                    (selection_acc_base * acc_importance)
-                    + (effective_intensity * int_importance)
-                )
-        elif score_acc_floor > 0.0:
-            if test_acc < score_acc_floor:
-                current_score = effective_score_acc * acc_importance
-            else:
-                physical_gate_progress = min(
-                    max((test_acc - score_acc_floor) / score_physical_transition_width, 0.0),
-                    1.0
-                )
-                current_score = (
-                    (score_acc_floor * acc_importance)
-                    + (effective_intensity * int_importance * physical_gate_progress)
-                )
-        else:
-            current_score = (effective_score_acc * acc_importance) + (effective_intensity * int_importance)
+            
+        current_score = (test_acc * acc_importance) + (effective_intensity * int_importance)
         if best_model_metric == 'val_acc':
             best_model_metric_value = test_acc
         elif best_model_metric == 'val_loss':
@@ -1956,27 +2009,20 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             print(f"Avg Inner Core Average Ratio: {avg_inner_core_average_ratio:.4f}")
             print(f"Avg Outer Halo Average Ratio: {avg_outer_halo_average_ratio:.4f}")
             print(f"Avg Soft Inside Core Focus Ratio: {avg_soft_inside_core_focus_ratio:.4f}")
-            print(f"Avg Inner Edge Average Ratio: {avg_inner_edge_average_ratio:.4f}")
-            print(f"Avg Outer Edge Average Ratio: {avg_outer_edge_average_ratio:.4f}")
-            print(f"Avg Inside Core Edge Focus Ratio: {avg_inside_core_edge_focus_ratio:.4f}")
             print(f"Avg Inside Core Outside Focus Ratio: {avg_inside_core_outside_focus_ratio:.4f}")
             print(f"Score Intensity Ratio ({score_intensity_source}): {avg_target_intensity_ratio:.4f}")
             print(f"Composite Score: {current_score:.4f}")
             print(f"Classification Loss Type: {classification_loss_type} | Detector Competition Helper: {detector_competition_loss_mode} | Global Objective: {global_physical_objective_mode} | Global Concentration Start Acc: {global_concentration_start_acc:.4f} | Global Enabled: {global_concentration_enabled}")
-            print(
-                f"Global Hold Remaining: {global_hold_remaining_epochs} | "
-                f"Class Relax Hold Remaining: {classification_relax_hold_remaining_epochs} | "
-                f"Detector Relax Hold Remaining: {detector_competition_relax_hold_remaining_epochs} | "
-                f"Detector Helper Weight: {current_epoch_detector_competition_weight:.4f} | "
-                f"Global Weight: {current_epoch_global_concentration_weight:.4f}"
-            )
+            print(f"Global Hold Remaining: {global_hold_remaining_epochs} | Detector Helper Weight: {current_epoch_detector_competition_weight:.4f} | Global Weight: {current_epoch_global_concentration_weight:.4f}")
             print(f"Train Loss Components | primary: {avg_train_primary_loss:.6f}, vec: {avg_train_loss_vec:.6f}, det_comp: {avg_train_detector_comp_loss:.6f}, global: {avg_train_global_conc_loss:.6f}, penalty: {avg_train_target_penalty:.6f}")
             print(f"Val Loss Components | primary: {avg_val_primary_loss:.6f}, vec: {avg_val_loss_vec:.6f}, det_comp: {avg_val_detector_comp_loss:.6f}, global: {avg_val_global_conc_loss:.6f}, penalty: {avg_val_target_penalty:.6f}")
             print(f"Best Model Metric: {best_model_metric} | Scheduler Metric: {scheduler_metric_name}")
+            if profile_enabled:
+                print_profile_summary("[BOOST PROFILE] Train", train_profile)
+                print_profile_summary("[BOOST PROFILE] Val", val_profile)
 
         if test_acc > best_acc:
             best_acc = test_acc
-            best_acc_epoch = epoch + 1
             if is_main_process:
                 torch.save(model_to_save.state_dict(), f"{save_dir}/best_acc_model.pth")
                 print(f"Saved best accuracy model with acc: {best_acc:.6f}")
@@ -1989,7 +2035,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
 
         if avg_test_loss < best_val_loss:
             best_val_loss = avg_test_loss
-            best_val_loss_epoch = epoch + 1
             if is_main_process:
                 torch.save(model_to_save.state_dict(), f"{save_dir}/best_loss_model.pth")
                 print(f"Saved best validation-loss model with val_loss: {best_val_loss:.6f}")
@@ -2009,7 +2054,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         if current_score > best_score:
             best_score = current_score
             best_score_acc = test_acc
-            best_score_epoch = epoch + 1
             if is_main_process:
                 torch.save(model_to_save.state_dict(), f"{save_dir}/best_score_model.pth")
                 print(f"Saved best score model with acc: {test_acc:.6f}, intensity: {avg_target_intensity_ratio:.4f}, score: {best_score:.4f}")
@@ -2025,34 +2069,6 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
                     status_msg += "; Best Score Model Saved"
                 else:
                     status_msg = "Best Score Model Saved"
-
-        for tier_threshold in score_tiered_save_min_accs:
-            if test_acc < tier_threshold:
-                continue
-            if current_score <= tiered_best_scores[tier_threshold]:
-                continue
-
-            tiered_best_scores[tier_threshold] = current_score
-            tiered_best_info[tier_threshold] = {
-                'epoch': epoch + 1,
-                'acc': test_acc,
-                'score': current_score,
-                'intensity': avg_target_intensity_ratio,
-            }
-            threshold_tag = format_acc_threshold_tag(tier_threshold)
-            if is_main_process:
-                tier_path = f"{save_dir}/best_score_acc_ge_{threshold_tag}_model.pth"
-                torch.save(model_to_save.state_dict(), tier_path)
-                print(
-                    f"Saved tiered best score model (acc >= {tier_threshold:.4f}) "
-                    f"with acc: {test_acc:.6f}, intensity: {avg_target_intensity_ratio:.4f}, "
-                    f"score: {current_score:.4f}"
-                )
-            tier_status = f"Best Score Acc>={tier_threshold:.4f} Saved"
-            if status_msg:
-                status_msg += f"; {tier_status}"
-            else:
-                status_msg = tier_status
             
         epoch_time = time.time() - epoch_start_time
         current_lr = optimizer.param_groups[0]['lr']
@@ -2060,7 +2076,7 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
         if is_main_process:
             # Log metrics to CSV
             with open(metrics_csv_path, 'a') as f:
-                f.write(f"{epoch + 1},{avg_train_loss:.6f},{avg_test_loss:.6f},{train_acc:.6f},{test_acc:.6f},{current_lr:.2e},{avg_train_primary_loss:.6f},{avg_val_primary_loss:.6f},{avg_train_loss_vec:.6f},{avg_val_loss_vec:.6f},{avg_train_detector_comp_loss:.6f},{avg_val_detector_comp_loss:.6f},{avg_train_global_conc_loss:.6f},{avg_val_global_conc_loss:.6f},{avg_train_target_penalty:.6f},{avg_val_target_penalty:.6f},{avg_detector_competition_ratio:.6f},{avg_global_concentration_ratio:.6f},{avg_outside_average_ratio:.6f},{avg_physical_focus_ratio:.6f},{avg_kernel_attract_ratio:.6f},{avg_target_ring_average_ratio:.6f},{avg_spatial_focus_ratio:.6f},{avg_soft_inside_ratio:.6f},{avg_inner_core_average_ratio:.6f},{avg_outer_halo_average_ratio:.6f},{avg_soft_inside_core_focus_ratio:.6f},{avg_inner_edge_average_ratio:.6f},{avg_outer_edge_average_ratio:.6f},{avg_inside_core_edge_focus_ratio:.6f},{avg_inside_core_outside_focus_ratio:.6f},{current_score:.6f},{scheduler_metric_value:.6f},{best_model_metric_value:.6f}\n")
+                f.write(f"{epoch + 1},{avg_train_loss:.6f},{avg_test_loss:.6f},{train_acc:.6f},{test_acc:.6f},{current_lr:.2e},{avg_train_primary_loss:.6f},{avg_val_primary_loss:.6f},{avg_train_loss_vec:.6f},{avg_val_loss_vec:.6f},{avg_train_detector_comp_loss:.6f},{avg_val_detector_comp_loss:.6f},{avg_train_global_conc_loss:.6f},{avg_val_global_conc_loss:.6f},{avg_train_target_penalty:.6f},{avg_val_target_penalty:.6f},{avg_detector_competition_ratio:.6f},{avg_global_concentration_ratio:.6f},{avg_outside_average_ratio:.6f},{avg_physical_focus_ratio:.6f},{avg_kernel_attract_ratio:.6f},{avg_target_ring_average_ratio:.6f},{avg_spatial_focus_ratio:.6f},{avg_soft_inside_ratio:.6f},{avg_inner_core_average_ratio:.6f},{avg_outer_halo_average_ratio:.6f},{avg_soft_inside_core_focus_ratio:.6f},{avg_inside_core_outside_focus_ratio:.6f},{current_score:.6f},{scheduler_metric_value:.6f},{best_model_metric_value:.6f}\n")
             
             # Write to log file
             with open(log_file_path, "a") as f:
@@ -2096,23 +2112,9 @@ def train(model, loss_function, optimizer, scheduler, trainloader, testloader,
             f.write("-" * 80 + "\n")
             f.write(f"Total training time: {elapsed_time:.2f} seconds\n")
             f.write(f"Best Validation Accuracy: {best_acc:.6f}\n")
-            f.write(f"Best Validation Accuracy Epoch: {best_acc_epoch}\n")
             f.write(f"Best Validation Loss: {best_val_loss:.6f}\n")
-            f.write(f"Best Validation Loss Epoch: {best_val_loss_epoch}\n")
             f.write(f"Validation Accuracy At Best Score: {best_score_acc:.6f}\n")
             f.write(f"Best Score: {best_score:.6f}\n")
-            f.write(f"Best Score Epoch: {best_score_epoch}\n")
-            for tier_threshold in score_tiered_save_min_accs:
-                tier_info = tiered_best_info[tier_threshold]
-                if tier_info['epoch'] > 0:
-                    f.write(
-                        f"Best Score Epoch At Acc >= {tier_threshold:.4f}: "
-                        f"{tier_info['epoch']} | Acc: {tier_info['acc']:.6f} | "
-                        f"Score: {tier_info['score']:.6f} | "
-                        f"Intensity: {tier_info['intensity']:.6f}\n"
-                    )
-                else:
-                    f.write(f"Best Score Epoch At Acc >= {tier_threshold:.4f}: none\n")
             f.write(f"Best Model Metric: {best_model_metric}\n")
             f.write(f"Scheduler Metric: {scheduler_metric_name}\n")
         
@@ -2203,7 +2205,7 @@ def get_available_memory():
 
 def main():
     # 1. We need to clear/reset the state for consecutive inline runs
-    global config, BATCH_SIZE, IMG_SIZE, PhaseMask, PIXEL_SIZE, wl, PADDINGx, PADDINGy, dataset_name, gpu_transform, gpu_transform_val, cpu_transform, device, is_ddp, local_rank, world_size, detector_pos_xy
+    global config, BATCH_SIZE, IMG_SIZE, PhaseMask, PIXEL_SIZE, wl, PADDINGx, PADDINGy, dataset_name, gpu_transform, gpu_transform_val, cpu_transform, device, is_ddp, local_rank, world_size, detector_pos_xy, BOOST_RUNTIME
     
     # Check if a custom config path was passed as an argument
     is_custom_config = False
@@ -2225,13 +2227,13 @@ def main():
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
             config = json.load(f)
-    fingerprint_ok, expected_fingerprint, actual_fingerprint = validate_train_code_fingerprint(config)
+    fingerprint_ok, expected_fingerprint, actual_fingerprint, fingerprint_key = validate_train_code_fingerprint(config)
     if expected_fingerprint:
-        print(f"[INIT] train.py fingerprint: {actual_fingerprint}")
+        print(f"[INIT] {SCRIPT_NAME} fingerprint: {actual_fingerprint} ({fingerprint_key})")
     if not fingerprint_ok:
         print(
-            f"[WARNING] Config fingerprint mismatch. Expected {expected_fingerprint}, "
-            f"but current train.py fingerprint is {actual_fingerprint}. Skipping run."
+            f"[WARNING] Config fingerprint mismatch for {fingerprint_key}. Expected {expected_fingerprint}, "
+            f"but current {SCRIPT_NAME} fingerprint is {actual_fingerprint}. Skipping run."
         )
         return
     
@@ -2243,7 +2245,15 @@ def main():
         import subprocess
         try:
             # Run batch_train.py in the same directory
-            result = subprocess.run([sys.executable, os.path.join(BASE_DIR, 'batch_train.py')], check=False)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    os.path.join(BASE_DIR, 'batch_train.py'),
+                    '--train-script',
+                    os.path.abspath(__file__)
+                ],
+                check=False
+            )
             sys.exit(result.returncode)
         except Exception as e:
             print(f"Batch training execution failed: {e}")
@@ -2263,6 +2273,32 @@ def main():
         local_rank = 0
         world_size = 1
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    BOOST_RUNTIME = build_boost_runtime(config, device)
+    configure_torch_runtime(BOOST_RUNTIME)
+    BOOST_RUNTIME['grad_scaler'] = create_grad_scaler(BOOST_RUNTIME) if BOOST_RUNTIME.get('use_amp', False) else None
+    config['_train_boost_runtime'] = {
+        'entrypoint': SCRIPT_NAME,
+        'use_amp': BOOST_RUNTIME.get('use_amp', False),
+        'amp_dtype': BOOST_RUNTIME.get('amp_dtype_name', 'disabled'),
+        'use_scaler': BOOST_RUNTIME.get('use_scaler', False),
+        'use_tf32': BOOST_RUNTIME.get('use_tf32', False),
+        'use_cudnn_benchmark': BOOST_RUNTIME.get('use_cudnn_benchmark', False),
+        'use_compile': BOOST_RUNTIME.get('use_compile', False),
+        'compile_mode': BOOST_RUNTIME.get('compile_mode', 'default'),
+        'compile_dynamic': BOOST_RUNTIME.get('compile_dynamic', False),
+        'compile_allow_complex': BOOST_RUNTIME.get('compile_allow_complex', False),
+        'profile_steps': BOOST_RUNTIME.get('profile_steps', False),
+        'profile_max_batches': BOOST_RUNTIME.get('profile_max_batches', 0),
+        'profile_warmup_batches': BOOST_RUNTIME.get('profile_warmup_batches', 0),
+    }
+    print(
+        "[BOOST] "
+        f"amp={BOOST_RUNTIME['use_amp']} ({BOOST_RUNTIME['amp_dtype_name']}), "
+        f"tf32={BOOST_RUNTIME['use_tf32']}, "
+        f"cudnn_benchmark={BOOST_RUNTIME['use_cudnn_benchmark']}, "
+        f"compile={BOOST_RUNTIME['use_compile']}"
+    )
 
     BATCH_SIZE = config.get('batch_size', 48)
 
@@ -2452,6 +2488,37 @@ def main():
         # Model (Defaults from global config)
         model = DNN()
         model = model.to(device)
+
+        if BOOST_RUNTIME.get('use_compile', False):
+            if not hasattr(torch, 'compile'):
+                print("[BOOST] torch.compile is unavailable in the current PyTorch build. Skipping compile.")
+                BOOST_RUNTIME['use_compile'] = False
+            elif is_ddp:
+                print("[BOOST] torch.compile is disabled for the DDP path in train_boost.py. Skipping compile.")
+                BOOST_RUNTIME['use_compile'] = False
+            elif not BOOST_RUNTIME.get('compile_allow_complex', False):
+                print(
+                    "[BOOST] torch.compile is skipped because this ONN path uses complex tensors/FFT, "
+                    "which currently break Inductor backward on some PyTorch builds. "
+                    "Set `boost_compile_allow_complex=true` only if you explicitly want to risk that path."
+                )
+                BOOST_RUNTIME['use_compile'] = False
+            else:
+                try:
+                    model = torch.compile(
+                        model,
+                        mode=BOOST_RUNTIME.get('compile_mode', 'default'),
+                        dynamic=BOOST_RUNTIME.get('compile_dynamic', False)
+                    )
+                    print(
+                        "[BOOST] torch.compile enabled "
+                        f"(mode={BOOST_RUNTIME.get('compile_mode', 'default')}, "
+                        f"dynamic={BOOST_RUNTIME.get('compile_dynamic', False)})."
+                    )
+                except Exception as exc:
+                    print(f"[BOOST] torch.compile failed, falling back to eager mode: {exc}")
+                    BOOST_RUNTIME['use_compile'] = False
+        config['_train_boost_runtime']['use_compile'] = BOOST_RUNTIME.get('use_compile', False)
         
         if is_ddp:
             model = DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -2490,10 +2557,12 @@ def main():
                                         strict_accuracy_ratio=strict_accuracy_ratio,
                                         minus_mask_ratio=minus_mask_ratio,
                                         label_num=label_num,
-                                        exp_name=exp_name)
+                                        exp_name=exp_name,
+                                        boost_runtime=BOOST_RUNTIME)
         
         if local_rank == 0:
-            print(f"Time taken (1 epoch): {time_1:.2f}s")
+            avg_epoch_time = time_1 / max(epochs, 1)
+            print(f"Average time per epoch: {avg_epoch_time:.2f}s")
             debug_log_path = os.path.join(target_save_dir, 'debug.log')
             
             # Setup global debug.log redirection if not in a terminal

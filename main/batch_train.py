@@ -10,6 +10,7 @@ overall_config.json itself is NOT treated as a training config.
 
 Usage:
     python batch_train.py
+    python batch_train.py --train-script train_boost.py
 """
 import os
 # Force thread limits BEFORE any other heavy imports to prevent RLIMIT_NPROC explosion in child processes
@@ -23,11 +24,14 @@ import shutil
 import subprocess
 import time
 import concurrent.futures
+import hashlib
+import argparse
+import importlib.util
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BATCH_CONFIG_DIR = os.path.join(BASE_DIR, 'batch_config')
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
-TRAIN_SCRIPT = os.path.join(BASE_DIR, 'train.py')
+DEFAULT_TRAIN_SCRIPT = os.path.join(BASE_DIR, 'train.py')
 OVERALL_CONFIG_NAME = 'overall_config.json'
 
 # Directory for storing temporary generated configs
@@ -35,6 +39,71 @@ TEMP_CONFIG_DIR = os.path.join(BASE_DIR, '.temp_batch_configs')
 
 # Keys reserved for batch_train control (not merged into training configs)
 BATCH_KEYS = {'max_parallel', 'use_ddp', 'nproc_per_node', 'master_port'}
+TRAIN_CODE_FINGERPRINT_KEY = 'train_code_fingerprint'
+INLINE_MODULE_CACHE = {}
+
+
+def parse_batch_args():
+    parser = argparse.ArgumentParser(description="Run batch training configs with an optional training entry script.")
+    parser.add_argument(
+        '--train-script',
+        default='',
+        help='Path to the training script entrypoint. Empty means using train.py.'
+    )
+    return parser.parse_args()
+
+
+def resolve_train_script(train_script_arg):
+    script_value = str(train_script_arg or '').strip()
+    if not script_value:
+        return DEFAULT_TRAIN_SCRIPT
+    if os.path.isabs(script_value):
+        return script_value
+    return os.path.abspath(os.path.join(BASE_DIR, script_value))
+
+
+def get_fingerprint_key(train_script_path):
+    script_name = os.path.splitext(os.path.basename(train_script_path))[0]
+    if script_name == 'train':
+        return TRAIN_CODE_FINGERPRINT_KEY
+    return f'{script_name}_code_fingerprint'
+
+
+def compute_train_code_fingerprint(train_script_path):
+    with open(train_script_path, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()[:12]
+
+
+def validate_train_code_fingerprint(config_obj, train_script_path):
+    fingerprint_key = get_fingerprint_key(train_script_path)
+    expected = str(config_obj.get(fingerprint_key, '')).strip()
+    actual = compute_train_code_fingerprint(train_script_path)
+
+    # Sidecar scripts such as train_boost.py may use their own fingerprint key.
+    # If the dedicated key is absent, we treat it as "no fingerprint enforcement"
+    # so existing configs can still be reused intentionally.
+    if fingerprint_key != TRAIN_CODE_FINGERPRINT_KEY and not expected:
+        return True, expected, actual, fingerprint_key
+
+    if not expected:
+        return True, expected, actual, fingerprint_key
+    return expected == actual, expected, actual, fingerprint_key
+
+
+def load_inline_train_module(train_script_path):
+    abs_path = os.path.abspath(train_script_path)
+    if abs_path in INLINE_MODULE_CACHE:
+        return INLINE_MODULE_CACHE[abs_path]
+
+    module_name = f"batch_train_entry_{hashlib.sha1(abs_path.encode('utf-8')).hexdigest()[:12]}"
+    spec = importlib.util.spec_from_file_location(module_name, abs_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load training module from {abs_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    INLINE_MODULE_CACHE[abs_path] = module
+    return module
 
 
 def load_overall_config():
@@ -68,7 +137,7 @@ def merge_config(shared_params, individual_path):
     return merged
 
 
-def run_one(cfg_file, shared_params, batch_opts, idx, total):
+def run_one(cfg_file, shared_params, batch_opts, train_script_path, idx, total):
     """Run a single training. Returns (cfg_file, status, detail)."""
     cfg_path = os.path.join(BATCH_CONFIG_DIR, cfg_file)
 
@@ -83,6 +152,19 @@ def run_one(cfg_file, shared_params, batch_opts, idx, total):
     except json.JSONDecodeError as e:
         print(f"  [{idx}/{total}] ERROR: Invalid JSON in {cfg_file}: {e}")
         return (cfg_file, 'SKIPPED', 'Invalid JSON')
+
+    fingerprint_ok, expected_fingerprint, actual_fingerprint, fingerprint_key = validate_train_code_fingerprint(
+        merged,
+        train_script_path
+    )
+    if expected_fingerprint:
+        print(f"  [{idx}/{total}] {os.path.basename(train_script_path)} fingerprint: {actual_fingerprint}")
+    if not fingerprint_ok:
+        print(
+            f"  [{idx}/{total}] WARNING: Fingerprint mismatch for {cfg_file}. "
+            f"Expected {expected_fingerprint} in {fingerprint_key}, current {os.path.basename(train_script_path)} is {actual_fingerprint}. Skipping."
+        )
+        return (cfg_file, 'SKIPPED', f'Fingerprint mismatch ({expected_fingerprint} != {actual_fingerprint})')
 
     # Ensure temp directory exists
     os.makedirs(TEMP_CONFIG_DIR, exist_ok=True)
@@ -109,17 +191,17 @@ def run_one(cfg_file, shared_params, batch_opts, idx, total):
                 sys.executable, "-m", "torch.distributed.run",
                 f"--nproc_per_node={nproc_per_node}",
                 f"--master_port={master_port}",
-                TRAIN_SCRIPT, tmp_config, "--is-subprocess"
+                train_script_path, tmp_config, "--is-subprocess"
             ]
             print(f"  [{idx}/{total}] Launching: {' '.join(cmd)}")
             proc = subprocess.run(cmd, cwd=BASE_DIR)
             returncode = proc.returncode
         else:
             # Instead of spawning a subprocess, run inline to share RAM cache
-            print(f"  [{idx}/{total}] Running inline: {tmp_config}")
-            import train as train_module
-            # Set sys.argv so train.py parses the right config
-            sys.argv = [TRAIN_SCRIPT, tmp_config]
+            print(f"  [{idx}/{total}] Running inline via {os.path.basename(train_script_path)}: {tmp_config}")
+            train_module = load_inline_train_module(train_script_path)
+            # Set sys.argv so the chosen training script parses the right config
+            sys.argv = [train_script_path, tmp_config]
             try:
                 train_module.main()
                 returncode = 0
@@ -143,7 +225,14 @@ def run_one(cfg_file, shared_params, batch_opts, idx, total):
 
 
 def main():
+    args = parse_batch_args()
+    train_script_path = resolve_train_script(args.train_script)
+    if not os.path.exists(train_script_path):
+        print(f"[BATCH INIT] Training script not found: {train_script_path}")
+        sys.exit(1)
+
     print(f"\n[BATCH INIT] Starting batch_train.py")
+    print(f"[BATCH INIT] Training entry script: {train_script_path}")
     batch_opts, shared_params = load_overall_config()
     max_parallel = batch_opts.get('max_parallel', 1)
 
@@ -168,13 +257,13 @@ def main():
     try:
         if max_parallel <= 1:
             for idx, cfg_file in enumerate(config_files, 1):
-                result = run_one(cfg_file, shared_params, batch_opts, idx, total)
+                result = run_one(cfg_file, shared_params, batch_opts, train_script_path, idx, total)
                 results.append(result)
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
                 futures = {}
                 for idx, cfg_file in enumerate(config_files, 1):
-                    future = executor.submit(run_one, cfg_file, shared_params, batch_opts, idx, total)
+                    future = executor.submit(run_one, cfg_file, shared_params, batch_opts, train_script_path, idx, total)
                     futures[future] = cfg_file
                 for future in concurrent.futures.as_completed(futures):
                     results.append(future.result())

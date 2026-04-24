@@ -7,12 +7,19 @@
 - In the compact epoch log line, `Int.Ratio` shows the ratio selected by `score_intensity_source`. For detailed interpretation of physical metrics, prefer `metrics.csv` columns such as `avg_global_concentration_ratio`, `avg_outside_average_ratio`, and `avg_physical_focus_ratio`.
 - For newer physical-objective experiments, verify the actual saved `metrics.csv` header in the run directory before assuming a metric is available. A metric may exist in the current code but still be absent from an older or mismatched run artifact.
 - If saved run artifacts contradict the current on-disk `train.py` behavior, assume the run was launched from a different code snapshot until that mismatch is explained. Treat the run directory as the source of truth and re-check the exact launcher / file provenance before drawing conclusions from code.
+- `train.py` now supports a code fingerprint guard via `train_code_fingerprint`. If the config field is non-empty, both `train.py` and `batch_train.py` validate it against the current `train.py` file content and skip the run with a warning when it does not match.
+- Current `train.py` fingerprint: `3c7af0d6c717`.
+- Workflow rule:
+  - every time `train.py` is modified, recompute the fingerprint
+  - update `train_code_fingerprint` in every config you still plan to run
+  - if you intentionally want a config to ignore fingerprint matching, leave `train_code_fingerprint` as an empty string
 
 This document explains all available configuration parameters used in `train.py`. You can copy `config.example.json` to `config.json` or `batch_config/your_config.json` and modify it.
 
 ## Basic Training
 - **`exp_name`**: Name of the experiment. Used to name the output folder in `results_dir`.
 - **`batch_train`**: (boolean) If `true`, the `train.py` script will redirect execution to `batch_train.py` to run all configs in `batch_config/`.
+- **`train_code_fingerprint`**: (string) Optional code fingerprint guard. If non-empty, the launcher verifies that the current `train.py` fingerprint matches this value before running. If it does not match, the run is skipped with a warning.
 - **`dataset_path`**: Path to the dataset (can be relative to `train.py` or absolute).
 - **`results_dir`**: Directory where training logs and models will be saved.
 - **`epochs`**: Total number of training epochs.
@@ -81,6 +88,7 @@ There are now two independent intensity-related terms:
   - `"global_ratio"`: The existing objective. Pushes the target detector's average intensity relative to the entire plane.
   - `"target_inside_outside"`: A two-term physical objective. It rewards target-detector average intensity and penalizes the average intensity outside the target detector.
   - `"target_attract_ring"`: A spatial objective for phase-2 tuning. It uses a continuous attraction kernel centered on the target detector and optionally penalizes the detector's outer ring region to suppress bright halos around detector edges.
+  - `"target_inside_core_edge"`: Rewards detector-inside and inner-core energy while explicitly penalizing bright edge bands just inside and just outside the detector boundary.
 - **`global_inside_reward_weight`**: (float) Relative weight of the target-inside reward when `global_physical_objective_mode = "target_inside_outside"`.
 - **`global_outside_penalty_weight`**: (float) Relative weight of the outside-energy penalty when `global_physical_objective_mode = "target_inside_outside"`.
 - **`global_attract_reward_weight`**: (float) Relative weight of the continuous attraction term when `global_physical_objective_mode = "target_attract_ring"`.
@@ -88,6 +96,10 @@ There are now two independent intensity-related terms:
 - **`global_attract_sigma_ratio`**: (float) Attraction-kernel width relative to `detector_size`. Larger values create a wider spatial attraction basin.
 - **`global_attract_extent_ratio`**: (float) Extra support radius of the local attraction crop relative to `detector_size`.
 - **`global_outer_ring_width_ratio`**: (float) Width of the penalized outer ring relative to `detector_size`.
+- **`global_inner_edge_penalty_weight`**: (float) Only used by `target_inside_core_edge`. Penalizes a narrow bright band just inside the detector boundary.
+- **`global_outer_edge_penalty_weight`**: (float) Only used by `target_inside_core_edge`. Penalizes a narrow bright band just outside the detector boundary.
+- **`global_inner_edge_width_ratio`**: (float) Width of the inner-edge penalty band relative to `detector_size`.
+- **`global_outer_edge_width_ratio`**: (float) Width of the outer-edge penalty band relative to `detector_size`.
 - **`global_concentration_start_acc`**: (float) Validation-accuracy threshold that must be reached before the global concentration loss is enabled. This is intended to keep early training classification-first.
 - **`global_concentration_hold_epochs`**: (int) Optional sticky window for the global loss. Once the validation accuracy reaches `global_concentration_start_acc`, the global loss stays enabled for this many subsequent epochs even if accuracy dips slightly below the threshold. Default is `0` (no sticky window).
 
@@ -116,18 +128,41 @@ There are now two independent intensity-related terms:
   The weight given to Validation Accuracy when calculating the `Composite Score` to determine the best model. Default is `1.0`.
 - **`best_model_intensity_weight`**: (float) **Intensity Importance in Model Selection.** 
   The weight given to the selected intensity ratio when calculating the `Composite Score` to determine the best model. Default is `0.5`.
-- **`score_intensity_source`**: (string) Which ratio to use in score/model selection. Options: `"detector_competition"`, `"global_concentration"`, `"physical_focus"`, or `"spatial_focus"`.
+- **`score_intensity_source`**: (string) Which ratio to use in score/model selection. Options include `"detector_competition"`, `"global_concentration"`, `"physical_focus"`, `"spatial_focus"`, `"soft_inside_core_focus"`, `"inside_core_edge_focus"`, and `"inside_core_outside_focus"`.
 - **`score_intensity_cap`**: (float) Caps the intensity contribution to `Composite Score` before aggressive optimization is triggered when using the legacy hard-cap score path.
 - **`score_use_soft_intensity`**: (boolean) If `true`, replaces the hard cap with a soft `tanh` normalization before intensity enters `Composite Score`. Defaults to `true` for `score_intensity_source = "spatial_focus"`.
 - **`score_intensity_reference`**: (float) Reference scale for the soft-normalized score path. Larger values make the intensity contribution grow more slowly.
 - **`score_acc_gate`**: (float) Accuracy threshold for unlocking the intensity contribution in the soft-normalized score path.
 - **`score_acc_gate_width`**: (float) Transition width for the accuracy gate. With `score_acc_gate = 0.995` and `score_acc_gate_width = 0.005`, the intensity term ramps from suppressed to fully active between `0.995` and `1.000` validation accuracy.
+- **`score_acc_cap`**: (float) Accuracy contribution cap used by the composite score. If positive, accuracy above this value stops increasing the score directly.
+- **`score_acc_floor`**: (float) Optional hard floor for aggressive physical optimization. Below this accuracy, the score falls back to accuracy-first behavior; at or above it, the score switches to a physical-selection regime.
+- **`score_physical_transition_width`**: (float) Width of the transition from the accuracy floor into the physics-dominant score regime. For example, with `score_acc_floor = 0.80` and `score_physical_transition_width = 0.10`, the physical term ramps in between `0.80` and `0.90` validation accuracy.
+- **`score_min_acc_for_selection`**: (float) Minimum validation accuracy required for a checkpoint to participate in composite-score model selection. Below this threshold the score is forced to a very low fallback value, so collapsed checkpoints do not overwrite `best_score_model.pth`.
+- **`score_tiered_save_min_accs`**: (list[float] or comma-separated string) Optional extra accuracy thresholds for tiered checkpointing. For each threshold, the trainer also writes `best_score_acc_ge_<threshold>_model.pth`, saving the highest-score checkpoint whose validation accuracy stays at or above that threshold.
 - **`score_outside_penalty_weight`**: (float) Only used when `score_intensity_source = "physical_focus"`. It sets how strongly outside average intensity reduces the selection score.
 - **`score_ring_penalty_weight`**: (float) Only used when `score_intensity_source = "spatial_focus"`. It sets how strongly target outer-ring intensity reduces the selection score.
+- **`score_inner_edge_penalty_weight`**: (float) Only used when `score_intensity_source = "inside_core_edge_focus"`. It sets how strongly bright intensity just inside the detector boundary reduces the selection score.
+- **`score_outer_edge_penalty_weight`**: (float) Only used when `score_intensity_source = "inside_core_edge_focus"`. It sets how strongly bright intensity just outside the detector boundary reduces the selection score.
 - Recommended note for `spatial_focus`:
   - do not blindly reuse the old `global_ratio` cap logic
   - prefer `score_use_soft_intensity = true`
   - give it its own `score_intensity_reference`
+- Recommended note for aggressive `inside_*` experiments:
+  - use `score_acc_floor` to define the minimum acceptable accuracy (for example `0.80`)
+  - use `score_min_acc_for_selection` when you want best-model selection to hard-filter checkpoints below that accuracy
+  - use `score_tiered_save_min_accs` when you want side-by-side physical-best checkpoints for multiple acceptable accuracy bands such as `0.99` and `0.985`
+  - set `score_acc_gate` near the same floor so the physical term starts contributing much earlier
+  - prefer larger `score_intensity_reference` values than the old gentle settings to avoid immediate `tanh` saturation
+
+### Classification-Loss Relaxation
+- **`classification_loss_relax_enabled`**: (boolean) If `true`, scales down the primary classification loss once batch accuracy is high enough.
+- **`classification_loss_relax_acc_threshold`**: (float) Accuracy threshold where classification-loss relaxation begins.
+- **`classification_loss_relax_transition_width`**: (float) Width of the relaxation transition. For example, with threshold `0.80` and width `0.10`, the classification loss ramps down between `0.80` and `0.90` batch accuracy.
+- **`classification_loss_relax_floor_ratio`**: (float) Minimum fraction of the original classification loss kept after relaxation fully activates. Smaller values are more aggressive and allow the physical objective to dominate.
+- **`classification_loss_relax_hold_epochs`**: (int) Optional validation-accuracy hold window. If the previous epoch reaches `classification_loss_relax_acc_threshold`, the trainer keeps the classification loss pinned at the relaxed floor for this many subsequent epochs, even if batch accuracy later dips.
+- **`detector_competition_relax_acc_threshold`**: (float) Validation-accuracy threshold that activates a temporary detector-helper retreat window. Defaults to `classification_loss_relax_acc_threshold`.
+- **`detector_competition_relax_hold_epochs`**: (int) Number of epochs to keep the detector competition helper in the relaxed state after the validation threshold is reached.
+- **`detector_competition_relax_floor_ratio`**: (float) Ratio of the original detector competition weight kept during the temporary retreat window. Set to `0.0` to fully mute the helper while the hold is active.
 
 ## Misalignment Simulation (Physical Error Modeling)
 To simulate the physical manufacturing and assembly tolerances, you can inject random sub-pixel misalignment and tilt errors between layers.
